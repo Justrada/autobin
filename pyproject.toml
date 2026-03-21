@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "framex"
+version = "0.1.0"
+description = "Local-first video logging pipeline for DaVinci Resolve — extract I-frames, transcribe audio, classify clips with a Vision LLM, and export metadata as CSV."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Justin Estrada"},
+]
+keywords = ["video", "davinci-resolve", "vlm", "whisper", "metadata", "logging", "i-frame"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+]
+
+dependencies = [
+    "opencv-python-headless>=4.8",
+    "scikit-image>=0.21",
+    "numpy>=1.24",
+    "pydantic>=2.0",
+    "PySide6>=6.6",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+mlx = [
+    "mlx-whisper>=0.1",
+]
+faster-whisper = [
+    "faster-whisper>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/justinestrada/framex"
+Issues = "https://github.com/justinestrada/framex/issues"
+
+[project.scripts]
+framex = "main:main"
+
+[project.gui-scripts]
+framex-gui = "main:main"
+
+[tool.setuptools.packages.find]
+include = ["core*", "gui*"]

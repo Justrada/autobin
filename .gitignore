@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Test footage & output (user-specific)
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.mxf
+*_output/
+output_frames/
+TEST FOOTAGE/
+
+# Whisper model cache (downloaded at runtime)
+whisper_models/
+
+# App settings (user-specific)
+settings.json
+
+# Exported CSVs
+*.csv
