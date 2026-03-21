@@ -25,6 +25,9 @@ env/
 .AppleDouble
 .LSOverride
 
+# Icon build intermediates
+*.iconset/
+
 # Test footage & output (user-specific)
 *.mp4
 *.mov
@@ -43,3 +46,6 @@ settings.json
 
 # Exported CSVs
 *.csv
+
+# Original screenshot (clean copy is in assets/)
+Screenshot*

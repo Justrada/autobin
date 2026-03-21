@@ -90,6 +90,26 @@ ollama pull qwen3.5:latest
 ollama serve
 ```
 
+## Build as macOS App
+
+You can build a standalone `FrameX.app` that you double-click to launch — no terminal needed:
+
+```bash
+# Install PyInstaller (one time)
+pip install pyinstaller
+
+# Build the app
+./build_app.sh
+
+# Launch it
+open dist/FrameX.app
+
+# Or copy to Applications
+cp -R dist/FrameX.app /Applications/
+```
+
+> **Note:** The app bundle is ~1.2 GB because it includes Python, PySide6, OpenCV, and numpy. ffmpeg and Ollama still need to be installed separately on the system.
+
 ## Usage
 
 ### GUI (recommended)
