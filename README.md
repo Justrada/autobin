@@ -1,12 +1,12 @@
-# FrameX
+# AutoBin
 
 **Local-first video logging pipeline for DaVinci Resolve Studio.**
 
-FrameX extracts contextual I-frames from your video files, transcribes audio, classifies clips using a local Vision LLM, detects multi-camera angles, and exports metadata as CSV for one-click import into DaVinci Resolve.
+AutoBin automatically logs your documentary footage — extracting I-frames, transcribing audio, classifying clips using a local Vision LLM, detecting multi-camera angles, and exporting metadata as CSV for one-click import into DaVinci Resolve.
 
 Everything runs locally on your machine — no cloud APIs required (though OpenAI and Anthropic are supported as optional backends).
 
-![FrameX GUI](assets/framex-screenshot.png)
+![AutoBin GUI](assets/autobin-screenshot.png)
 
 ## What It Does
 
@@ -39,15 +39,31 @@ Video Files ──┬── Extract I-Frames (ffmpeg + auto-threshold tuning)
 - **DaVinci Resolve CSV export** — Per-clip and combined CSVs with all metadata columns
 - **Folder scanning** — Drop a folder, process everything recursively. Subfolder names become tags
 - **Custom vocabulary** — Bias Whisper toward project-specific names and terms
+- **First-run setup wizard** — Automatically detects and installs missing dependencies (ffmpeg, Ollama, Qwen model)
+
+## Quick Start (macOS App)
+
+Download or build `AutoBin.app` and double-click to launch. On first run, the setup wizard will walk you through installing any missing dependencies.
+
+```bash
+# Build the app
+./build_app.sh
+
+# Launch it
+open dist/AutoBin.app
+
+# Or copy to Applications
+cp -R dist/AutoBin.app /Applications/
+```
 
 ## Requirements
 
 | Requirement | Install | Notes |
 |---|---|---|
 | **Python 3.10+** | [python.org](https://www.python.org/) or `brew install python` | 3.11+ recommended |
-| **ffmpeg** | `brew install ffmpeg` | Used for frame extraction and audio processing |
-| **Ollama** | [ollama.com](https://ollama.com/) | Local LLM server (default backend) |
-| **Qwen 3.5 VL** | `ollama pull qwen3.5:latest` | Vision-language model for clip analysis |
+| **ffmpeg** | `brew install ffmpeg` | Auto-installed by setup wizard |
+| **Ollama** | [ollama.com](https://ollama.com/) | Auto-installed by setup wizard |
+| **Qwen 3.5 VL** | `ollama pull qwen3.5:latest` | Auto-pulled by setup wizard |
 
 ### Hardware
 
@@ -55,12 +71,12 @@ Video Files ──┬── Extract I-Frames (ffmpeg + auto-threshold tuning)
 - **16GB+ RAM** — 24GB recommended for the Qwen 3.5 9B model
 - Works on Intel Macs and Linux with `faster-whisper` as the transcription backend
 
-## Installation
+## Installation (from source)
 
 ```bash
 # Clone the repo
-git clone https://github.com/justinestrada/framex.git
-cd framex
+git clone https://github.com/Justrada/autobin.git
+cd autobin
 
 # Create a virtual environment
 python3 -m venv .venv
@@ -77,22 +93,9 @@ pip install mlx-whisper
 # pip install faster-whisper
 ```
 
-### Ollama Setup
-
-```bash
-# Install Ollama (if not already installed)
-brew install ollama
-
-# Pull the default vision model
-ollama pull qwen3.5:latest
-
-# Start the Ollama server (runs in background)
-ollama serve
-```
-
 ## Build as macOS App
 
-You can build a standalone `FrameX.app` that you double-click to launch — no terminal needed:
+You can build a standalone `AutoBin.app` that you double-click to launch — no terminal needed:
 
 ```bash
 # Install PyInstaller (one time)
@@ -102,13 +105,13 @@ pip install pyinstaller
 ./build_app.sh
 
 # Launch it
-open dist/FrameX.app
+open dist/AutoBin.app
 
 # Or copy to Applications
-cp -R dist/FrameX.app /Applications/
+cp -R dist/AutoBin.app /Applications/
 ```
 
-> **Note:** The app bundle is ~1.2 GB because it includes Python, PySide6, OpenCV, and numpy. ffmpeg and Ollama still need to be installed separately on the system.
+> **Note:** The app bundle is ~1.2 GB because it includes Python, PySide6, OpenCV, and numpy. On first launch, the setup wizard checks for ffmpeg and Ollama and offers one-click install via Homebrew.
 
 ## Usage
 
@@ -118,11 +121,12 @@ cp -R dist/FrameX.app /Applications/
 python main.py
 ```
 
-1. **Add videos** — Click "Add Files" or "Add Folder" to queue videos
-2. **Configure settings** — Adjust LLM model, transcription backend, similarity metric, etc.
-3. **Start processing** — Click "Start" to run the full pipeline on your queue
-4. **Review metadata** — Click any clip to see and edit its metadata in the right panel
-5. **Export** — CSVs are auto-generated per clip and as a combined file
+1. **First run** — The setup wizard checks for ffmpeg, Ollama, and the Qwen model. Install anything missing with one click.
+2. **Add videos** — Click "Add Files" or "Add Folder" to queue videos
+3. **Configure settings** — Adjust LLM model, transcription backend, similarity metric, etc.
+4. **Start processing** — Click "Start" to run the full pipeline on your queue
+5. **Review metadata** — Click any clip to see and edit its metadata in the right panel
+6. **Export** — CSVs are auto-generated per clip and as a combined file
 
 ### CLI (frame extraction only)
 
@@ -178,9 +182,11 @@ The exported CSV has these columns, ready for DaVinci Resolve's `File > Import M
 ## Project Structure
 
 ```
-framex/
-    main.py                     # GUI entry point
+autobin/
+    main.py                     # GUI entry point (+ setup wizard trigger)
     extract_iframes.py          # CLI entry point (standalone)
+    build_app.sh                # One-command macOS .app build
+    AutoBin.spec                # PyInstaller configuration
     requirements.txt
     pyproject.toml
 
@@ -195,6 +201,7 @@ framex/
 
     gui/
         main_window.py          # Main application window
+        setup_wizard.py         # First-run dependency checker + installer
         queue_panel.py          # Video queue (add/remove/reorder)
         settings_panel.py       # All configurable settings
         progress_panel.py       # Pipeline progress display
@@ -205,7 +212,7 @@ framex/
 
 ## How Multi-Camera Detection Works
 
-FrameX identifies clips filmed from different angles of the same scene by comparing their transcripts:
+AutoBin identifies clips filmed from different angles of the same scene by comparing their transcripts:
 
 1. Normalize transcripts (lowercase, remove stopwords and punctuation)
 2. Build 5-gram sets from each transcript

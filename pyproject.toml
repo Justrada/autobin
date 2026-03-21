@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "framex"
+name = "autobin"
 version = "0.1.0"
 description = "Local-first video logging pipeline for DaVinci Resolve — extract I-frames, transcribe audio, classify clips with a Vision LLM, and export metadata as CSV."
 readme = "README.md"
@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 authors = [
     {name = "Justin Estrada"},
 ]
-keywords = ["video", "davinci-resolve", "vlm", "whisper", "metadata", "logging", "i-frame"]
+keywords = ["video", "davinci-resolve", "vlm", "whisper", "metadata", "logging", "documentary", "autobin"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: End Users/Desktop",
@@ -44,14 +44,14 @@ faster-whisper = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/justinestrada/framex"
-Issues = "https://github.com/justinestrada/framex/issues"
+Homepage = "https://github.com/Justrada/autobin"
+Issues = "https://github.com/Justrada/autobin/issues"
 
 [project.scripts]
-framex = "main:main"
+autobin = "main:main"
 
 [project.gui-scripts]
-framex-gui = "main:main"
+autobin-gui = "main:main"
 
 [tool.setuptools.packages.find]
 include = ["core*", "gui*"]

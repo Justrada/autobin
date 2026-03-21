@@ -1,12 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec file for FrameX.
+PyInstaller spec file for AutoBin.
 
 Usage:
-    pyinstaller FrameX.spec
+    pyinstaller AutoBin.spec
 
 Output:
-    dist/FrameX.app
+    dist/AutoBin.app
 """
 
 import sys
@@ -53,6 +53,7 @@ a = Analysis(
         "gui.settings_panel",
         "gui.workers",
         "gui.filmstrip",
+        "gui.setup_wizard",
         "cv2",
         "numpy",
         "requests",
@@ -82,7 +83,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="FrameX",
+    name="AutoBin",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -100,17 +101,17 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="FrameX",
+    name="AutoBin",
 )
 
 app = BUNDLE(
     coll,
-    name="FrameX.app",
-    icon="assets/FrameX.icns",
-    bundle_identifier="com.justinestrada.framex",
+    name="AutoBin.app",
+    icon="assets/AutoBin.icns",
+    bundle_identifier="com.justinestrada.autobin",
     info_plist={
-        "CFBundleName": "FrameX",
-        "CFBundleDisplayName": "FrameX",
+        "CFBundleName": "AutoBin",
+        "CFBundleDisplayName": "AutoBin",
         "CFBundleVersion": "0.1.0",
         "CFBundleShortVersionString": "0.1.0",
         "NSHighResolutionCapable": True,

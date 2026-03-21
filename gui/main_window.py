@@ -35,7 +35,7 @@ SETTINGS_PATH = os.path.expanduser("~/.config/vlm_iframe/settings.json")
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("VLM I-Frame Extractor")
+        self.setWindowTitle("AutoBin")
         self.setMinimumSize(1100, 700)
 
         self._settings = self._load_settings()
