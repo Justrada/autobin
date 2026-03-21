@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "autobin"
 version = "0.1.0"
-description = "Local-first video logging pipeline for DaVinci Resolve — extract I-frames, transcribe audio, classify clips with a Vision LLM, and export metadata as CSV."
+description = "Local-first video logging pipeline for DaVinci Resolve. Extracts I-frames, transcribes audio, classifies clips with a local Vision LLM, and exports metadata as CSV."
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "GPL-3.0-or-later"}
 requires-python = ">=3.10"
 authors = [
     {name = "Justin Estrada"},
@@ -16,7 +16,7 @@ keywords = ["video", "davinci-resolve", "vlm", "whisper", "metadata", "logging",
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",

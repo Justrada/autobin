@@ -12,7 +12,7 @@ import json
 from typing import Optional
 
 import requests
-from PySide6.QtCore import Qt, QThread, Signal, Slot
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -78,6 +78,21 @@ _CONTINUE_DISABLED = f"""
         padding: 10px 32px;
         font-size: 14px;
         font-weight: 600;
+    }}
+"""
+
+_QUIT_STYLE = f"""
+    QPushButton {{
+        background-color: transparent;
+        color: {_TEXT_DIM};
+        border: none;
+        border-radius: 6px;
+        padding: 8px 20px;
+        font-size: 13px;
+    }}
+    QPushButton:hover {{
+        color: {_RED};
+        background-color: #2d2d2d;
     }}
 """
 
@@ -161,20 +176,47 @@ class _InstallWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
+# Worker thread for checking dependencies (non-blocking)
+# ---------------------------------------------------------------------------
+class _CheckWorker(QThread):
+    """Runs dependency checks off the main thread so the UI stays responsive."""
+
+    checks_done = Signal(bool, bool, bool, bool)  # ffmpeg, ollama, serving, model
+
+    def run(self):
+        has_ffmpeg = bool(shutil.which("ffmpeg"))
+        has_ollama = bool(shutil.which("ollama"))
+
+        ollama_running = False
+        model_found = False
+        try:
+            resp = requests.get("http://localhost:11434/api/tags", timeout=2)
+            if resp.status_code == 200:
+                ollama_running = True
+                models = [m.get("name", "") for m in resp.json().get("models", [])]
+                model_found = any("qwen3.5" in m for m in models)
+        except Exception:
+            pass
+
+        self.checks_done.emit(has_ffmpeg, has_ollama, ollama_running, model_found)
+
+
+# ---------------------------------------------------------------------------
 # Lightweight dependency check (no GUI)
 # ---------------------------------------------------------------------------
 def needs_setup() -> bool:
     """Return *True* if any required dependency is missing.
 
     This is intentionally fast so the main window can call it on startup
-    to decide whether to show the wizard.
+    to decide whether to show the wizard.  Only checks local binaries
+    first — the network check uses a short timeout.
     """
     if not shutil.which("ffmpeg"):
         return True
     if not shutil.which("ollama"):
         return True
     try:
-        resp = requests.get("http://localhost:11434/api/tags", timeout=3)
+        resp = requests.get("http://localhost:11434/api/tags", timeout=1)
         if resp.status_code != 200:
             return True
         models = [m.get("name", "") for m in resp.json().get("models", [])]
@@ -202,6 +244,7 @@ class _DepRow(QWidget):
     ):
         super().__init__(parent)
         self._passed = False
+        self._default_action_label = action_label
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 6, 10, 6)
@@ -251,7 +294,7 @@ class _DepRow(QWidget):
             self._btn.setText("Installing\u2026")
         else:
             self._btn.setEnabled(True)
-            self._btn.setText("Install")
+            self._btn.setText(self._default_action_label)
 
     # -- internal --
     def _set_icon(self, ok: bool):
@@ -274,14 +317,17 @@ class SetupWizard(QDialog):
         self.setWindowTitle("AutoBin Setup")
         self.setFixedSize(600, 500)
         self.setStyleSheet(_DIALOG_STYLE)
+        # Keep the close button so users can always quit
         self.setWindowFlags(
-            Qt.Dialog | Qt.WindowTitleHint | Qt.CustomizeWindowHint
+            Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint
         )
 
         self._workers: list[_InstallWorker] = []
+        self._check_worker: _CheckWorker | None = None
         self._brew_available: bool = self._check_brew_installed()
         self._build_ui()
-        self._run_checks()
+        # Run checks asynchronously after the window is shown
+        QTimer.singleShot(0, self._run_checks)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -338,6 +384,14 @@ class SetupWizard(QDialog):
             action_label="Pull",
         )
 
+        # Show a "checking..." state initially
+        self._status_label = QLabel("Checking dependencies\u2026")
+        self._status_label.setAlignment(Qt.AlignCenter)
+        self._status_label.setStyleSheet(
+            f"font-size: 12px; color: {_TEXT_DIM}; margin-bottom: 8px;"
+        )
+        card_layout.addWidget(self._status_label)
+
         for row in (
             self._row_ffmpeg,
             self._row_ollama,
@@ -370,6 +424,12 @@ class SetupWizard(QDialog):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(12)
 
+        self._quit_btn = QPushButton("Quit")
+        self._quit_btn.setStyleSheet(_QUIT_STYLE)
+        self._quit_btn.setCursor(Qt.PointingHandCursor)
+        self._quit_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self._quit_btn)
+
         self._refresh_btn = QPushButton("Refresh")
         self._refresh_btn.setStyleSheet(_REFRESH_STYLE)
         self._refresh_btn.setCursor(Qt.PointingHandCursor)
@@ -393,28 +453,30 @@ class SetupWizard(QDialog):
         self._row_model.install_requested.connect(self._pull_model)
 
     # ------------------------------------------------------------------
-    # Dependency checks
+    # Dependency checks (async — never blocks the UI)
     # ------------------------------------------------------------------
     def _run_checks(self):
-        self._row_ffmpeg.set_passed(bool(shutil.which("ffmpeg")))
-        self._row_ollama.set_passed(bool(shutil.which("ollama")))
+        """Kick off dependency checks on a background thread."""
+        self._refresh_btn.setEnabled(False)
+        self._status_label.setText("Checking dependencies\u2026")
+        self._status_label.setVisible(True)
 
-        ollama_running = False
-        model_found = False
-        try:
-            resp = requests.get("http://localhost:11434/api/tags", timeout=3)
-            if resp.status_code == 200:
-                ollama_running = True
-                models = [m.get("name", "") for m in resp.json().get("models", [])]
-                model_found = any("qwen3.5" in m for m in models)
-        except Exception:
-            pass
+        self._check_worker = _CheckWorker(parent=self)
+        self._check_worker.checks_done.connect(self._on_checks_done)
+        self._check_worker.start()
 
+    @Slot(bool, bool, bool, bool)
+    def _on_checks_done(self, has_ffmpeg, has_ollama, ollama_running, model_found):
+        """Update UI with check results (runs on main thread via signal)."""
+        self._row_ffmpeg.set_passed(has_ffmpeg)
+        self._row_ollama.set_passed(has_ollama)
         self._row_serve.set_passed(ollama_running)
         self._row_model.set_passed(model_found)
 
         self._brew_available = self._check_brew_installed()
         self._brew_warning.setVisible(not self._brew_available)
+        self._refresh_btn.setEnabled(True)
+        self._status_label.setVisible(False)
         self._update_continue_state()
 
     def _update_continue_state(self):
