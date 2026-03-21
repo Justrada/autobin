@@ -141,4 +141,4 @@ AutoBin is licensed under the [GNU General Public License v3](LICENSE).
 
 **What that means in practice:** you can use it, modify it, share it, whatever you want. The one rule is that if you distribute a modified version, you have to release your source code under the same license. It stays open.
 
-**Commercial licensing:** if you want to use AutoBin in a proprietary product (something you're selling where you don't want to open-source your code), get in touch and we can work out a commercial license. Email me at [TODO: your email] or open an issue on GitHub.
+**Commercial licensing:** if you want to use AutoBin in a proprietary product (something you're selling where you don't want to open-source your code), get in touch and we can work out a commercial license. Email me at JustinPEstrada@gmail.com or open an issue on GitHub.
