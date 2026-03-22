@@ -18,8 +18,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-VIDEO_EXTENSIONS = "Video Files (*.mp4 *.mov *.avi *.mkv *.webm *.m4v *.mts *.ts);;All Files (*)"
-VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".mts", ".ts"}
+VIDEO_EXTENSIONS = (
+    "Video Files (*.mp4 *.mov *.avi *.mkv *.webm *.m4v *.mts *.ts "
+    "*.360 *.lrv *.mxf *.r3d *.braw *.flv *.wmv *.mpg *.mpeg);;"
+    "All Files (*)"
+)
+VIDEO_SUFFIXES = {
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".mts", ".ts",
+    ".360", ".lrv",          # GoPro 360 + low-res proxy
+    ".mxf",                  # Broadcast / Sony / Panasonic
+    ".r3d", ".braw",         # RED / Blackmagic RAW
+    ".flv", ".wmv",          # Legacy web / Windows
+    ".mpg", ".mpeg",         # MPEG
+}
 
 # Qt.UserRole constants
 ROLE_PATH = 256         # Qt.UserRole

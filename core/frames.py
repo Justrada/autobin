@@ -11,10 +11,27 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from typing import Callable
 
 import cv2
 import numpy as np
+
+
+# Codecs where every frame is an I-frame (all-intra / intermediate codecs).
+# For these, -skip_frame nokey returns *every* frame, so we sample at
+# fixed intervals instead.
+ALL_INTRA_CODECS = {
+    "cfhd",          # GoPro CineForm
+    "prores",        # Apple ProRes (all variants)
+    "dnxhd", "dnxhr",# Avid DNxHD / DNxHR
+    "mjpeg",         # Motion JPEG
+    "v210",          # Uncompressed 10-bit
+    "rawvideo",      # Raw
+    "huffyuv",       # Huffman lossless
+    "ffv1",          # FFV1 lossless
+    "jpeg2000",      # JPEG 2000
+}
 
 
 # ---------------------------------------------------------------------------
@@ -92,9 +109,101 @@ def extract_iframes(video_path: str, temp_dir: str, max_width: int = 640,
     return frames
 
 
+def sample_frames_by_seeking(video_path: str, temp_dir: str,
+                             duration: float, time_budget: float = 10.0,
+                             max_width: int = 640,
+                             log: Callable[[str], None] | None = None) -> list[str]:
+    """
+    Binary subdivision sampler for all-intra codecs (CineForm, ProRes, etc.).
+
+    Instead of deciding a frame count upfront, this grabs frames in order of
+    maximum coverage: midpoint first, then quarter-points, then eighths, etc.
+    It keeps going until the time budget runs out. This way, faster machines
+    and smaller files naturally get more frames, and you always have the best
+    possible coverage for the time spent.
+
+    The time_budget (seconds) is configurable in settings.
+    """
+    import collections
+    deadline = time.time() + time_budget
+
+    if log:
+        log(f"[extract] All-intra codec — subdividing clip (budget: {time_budget:.0f}s)...")
+
+    # Build the subdivision queue: BFS over midpoints
+    # Start with the full range, grab its midpoint, split into two halves, repeat
+    queue: collections.deque[tuple[float, float]] = collections.deque()
+    queue.append((0.0, duration))
+
+    # Always grab the very first and last frame first (endpoints)
+    seek_order: list[float] = [0.0, max(0.0, duration - 0.5)]
+
+    while queue:
+        lo, hi = queue.popleft()
+        mid = (lo + hi) / 2.0
+        # Skip if this segment is too small to meaningfully subdivide
+        if (hi - lo) < 1.0:
+            continue
+        seek_order.append(mid)
+        queue.append((lo, mid))
+        queue.append((mid, hi))
+
+    # Deduplicate while preserving order
+    seen: set[float] = set()
+    unique_order: list[float] = []
+    for ts in seek_order:
+        rounded = round(ts, 2)
+        if rounded not in seen:
+            seen.add(rounded)
+            unique_order.append(rounded)
+
+    # Seek frames until time runs out
+    grabbed: dict[float, str] = {}  # timestamp -> path
+    count = 0
+
+    for ts in unique_order:
+        if time.time() >= deadline:
+            if log:
+                log(f"[extract] Time budget reached after {count} frames")
+            break
+
+        out_path = os.path.join(temp_dir, f"iframe_{count:06d}.png")
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "warning",
+            "-ss", f"{ts:.3f}",
+            "-i", video_path,
+            "-vf", f"scale='min({max_width},iw)':-2",
+            "-frames:v", "1",
+            "-q:v", "2",
+            out_path,
+        ]
+        subprocess.run(cmd, capture_output=True, text=True)
+        if os.path.exists(out_path):
+            grabbed[ts] = out_path
+            count += 1
+
+    # Sort by timestamp so downstream filtering gets frames in order
+    sorted_timestamps = sorted(grabbed.keys())
+    frames = [grabbed[ts] for ts in sorted_timestamps]
+
+    # Rename in chronological order so frame numbers make sense
+    renamed: list[str] = []
+    for i, path in enumerate(frames):
+        new_path = os.path.join(temp_dir, f"iframe_{i:06d}_sorted.png")
+        os.rename(path, new_path)
+        renamed.append(new_path)
+
+    if log:
+        elapsed = time_budget - max(0, deadline - time.time())
+        log(f"[extract] Sampled {len(renamed)} frames in {elapsed:.1f}s")
+    return renamed
+
+
 def get_frame_num(path: str) -> int:
-    """Extract frame number from 'iframe_000102.png' -> 102."""
-    match = re.search(r"iframe_(\d+)\.png", os.path.basename(path))
+    """Extract frame number from 'iframe_000102.png' or 'iframe_000102_sorted.png' -> 102."""
+    match = re.search(r"iframe_(\d+)(?:_sorted)?\.png", os.path.basename(path))
     return int(match.group(1)) if match else 0
 
 
@@ -336,9 +445,20 @@ def run_frame_pipeline(video_path: str, output_dir: str,
          f"{info['duration']:.1f}s ({duration_min:.1f} min)")
 
     metric_fn = METRICS[metric]
+    is_all_intra = info["codec"].lower() in ALL_INTRA_CODECS
 
     with tempfile.TemporaryDirectory(prefix="iframes_") as tmp:
-        iframe_paths = extract_iframes(video_path, tmp, log=log)
+        if is_all_intra:
+            # All-intra codec: binary subdivision with time budget.
+            # Grabs midpoint, then quarters, then eighths, etc.
+            # until the time budget runs out.
+            iframe_paths = sample_frames_by_seeking(
+                video_path, tmp, info["duration"],
+                time_budget=10.0, log=log,
+            )
+        else:
+            iframe_paths = extract_iframes(video_path, tmp, log=log)
+
         if not iframe_paths:
             _log("[error] No I-frames found.")
             return []
@@ -355,12 +475,27 @@ def run_frame_pipeline(video_path: str, output_dir: str,
         guide_paths = filter_guide_paths(iframe_paths, threshold, metric_fn)
         _log(f"[filter] {len(guide_paths)} guide scenes identified.")
 
-        target_indices = determine_target_indices(
-            guide_paths, info["total_frames"], offset, log=log
-        )
-
-        saved = extract_final_frames(video_path, target_indices, output_dir,
-                                     log=log, progress=progress)
+        if is_all_intra:
+            # For all-intra codecs, the sampled frames are already good
+            # enough for VLM analysis (640px). Copy the guide frames to
+            # the output dir instead of re-seeking into the huge file,
+            # which would be just as slow as the initial extraction.
+            import shutil
+            os.makedirs(output_dir, exist_ok=True)
+            saved = []
+            for i, path in enumerate(guide_paths):
+                dst = os.path.join(output_dir, f"frame_{i+1:03d}.jpg")
+                shutil.copy2(path, dst)
+                saved.append(dst)
+                if progress:
+                    progress(i + 1, len(guide_paths))
+            _log(f"[output] Copied {len(saved)} guide frames to {output_dir}/")
+        else:
+            target_indices = determine_target_indices(
+                guide_paths, info["total_frames"], offset, log=log
+            )
+            saved = extract_final_frames(video_path, target_indices, output_dir,
+                                         log=log, progress=progress)
 
     _log(f"[done] {len(saved)} contextual frames saved ({len(saved)/duration_min:.1f}/min)")
     return saved
