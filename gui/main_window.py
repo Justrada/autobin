@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import os
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
+    QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSplitter,
     QTabWidget,
@@ -33,6 +35,72 @@ SETTINGS_PATH = os.path.expanduser("~/.config/vlm_iframe/settings.json")
 QUEUE_STATE_PATH = os.path.expanduser("~/.config/vlm_iframe/queue_state.json")
 
 
+class ShutdownOverlay(QWidget):
+    """Full-window overlay that blocks interaction while workers finish."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setAutoFillBackground(True)
+
+        # Dark semi-transparent background
+        self.setStyleSheet("""
+            ShutdownOverlay {
+                background: rgba(10, 10, 20, 220);
+            }
+            QLabel#shutdownHeading {
+                color: #ffffff;
+                font-size: 22px;
+                font-weight: bold;
+            }
+            QLabel#shutdownDetail {
+                color: #aabbcc;
+                font-size: 13px;
+            }
+            QProgressBar {
+                background: #1a1a2e;
+                border: 1px solid #334466;
+                border-radius: 6px;
+                height: 18px;
+                text-align: center;
+                font-size: 11px;
+                color: #aabbcc;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #4488ff, stop:1 #66aaff
+                );
+                border-radius: 5px;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        heading = QLabel("SHUTTING DOWN")
+        heading.setObjectName("shutdownHeading")
+        heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(heading)
+
+        self._detail = QLabel("Waiting for active processes to finish...")
+        self._detail.setObjectName("shutdownDetail")
+        self._detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._detail)
+
+        self._bar = QProgressBar()
+        self._bar.setFixedWidth(360)
+        self._bar.setRange(0, 0)  # indeterminate pulsing bar
+        layout.addWidget(self._bar, alignment=Qt.AlignmentFlag.AlignCenter)
+
+    def set_detail(self, text: str):
+        self._detail.setText(text)
+
+    def set_determinate(self, value: int, maximum: int):
+        self._bar.setRange(0, maximum)
+        self._bar.setValue(value)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -46,6 +114,7 @@ class MainWindow(QMainWindow):
 
         self._active_index: int = -1
         self._multicam_groups: list = []
+        self._shutdown_confirmed = False
 
         # Restore previous queue if one was saved
         self._restore_queue_state()
@@ -425,7 +494,75 @@ class MainWindow(QMainWindow):
         self.queue_panel._update_header()
 
     def closeEvent(self, event):
+        # If shutdown already confirmed (workers finished), close for real
+        if self._shutdown_confirmed:
+            super().closeEvent(event)
+            return
+
+        # Save settings and queue state immediately (these are fast)
         self._settings = self.settings_panel.save_to_settings()
         self._save_settings()
         self._save_queue_state()
-        super().closeEvent(event)
+
+        # If no workers are running, close immediately
+        workers = self._orchestrator.get_active_workers()
+        if not workers and not self._orchestrator._running:
+            super().closeEvent(event)
+            return
+
+        # Workers are still running — show the shutdown overlay
+        event.ignore()
+        self._begin_graceful_shutdown()
+
+    def _begin_graceful_shutdown(self):
+        """Show overlay, stop the pipeline, and poll until workers finish."""
+        # Prevent double-shutdown
+        if hasattr(self, "_shutdown_overlay") and self._shutdown_overlay.isVisible():
+            return
+
+        # Tell the orchestrator to stop accepting new work
+        self._orchestrator.stop()
+
+        # Create and show the overlay
+        self._shutdown_overlay = ShutdownOverlay(self)
+        self._shutdown_overlay.setGeometry(self.centralWidget().geometry())
+        self._shutdown_overlay.raise_()
+        self._shutdown_overlay.show()
+
+        # Disable all interaction underneath
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+
+        # Poll every 250ms until all workers finish
+        self._shutdown_timer = QTimer(self)
+        self._shutdown_timer.setInterval(250)
+        self._shutdown_timer.timeout.connect(self._check_shutdown_progress)
+        self._shutdown_timer.start()
+
+    def _check_shutdown_progress(self):
+        """Poll active workers. When all done, save and close for real."""
+        workers = self._orchestrator.get_active_workers()
+
+        if workers:
+            names = []
+            for w in workers:
+                # Get a friendly name from the class
+                name = type(w).__name__.replace("Worker", "")
+                names.append(name)
+            self._shutdown_overlay.set_detail(
+                f"Waiting for: {', '.join(names)}"
+            )
+            return
+
+        # All workers finished
+        self._shutdown_timer.stop()
+        self._shutdown_overlay.set_detail("Saving state...")
+        self._shutdown_overlay.set_determinate(1, 1)
+
+        # Final save (workers may have written results since the first save)
+        self._save_queue_state()
+
+        # Now actually close
+        self._shutdown_overlay.hide()
+        self._shutdown_confirmed = True
+        self.close()

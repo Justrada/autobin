@@ -613,6 +613,17 @@ class PipelineOrchestrator(QObject):
         self._current_index += 1
         self._process_next()
 
+    def get_active_workers(self) -> list:
+        """Return list of currently running QThread workers."""
+        workers = []
+        for attr in ("_audio_worker", "_classify_worker", "_transcript_worker",
+                      "_frame_worker", "_llm_worker", "_refine_worker",
+                      "_multicam_worker"):
+            w = getattr(self, attr, None)
+            if w is not None and w.isRunning():
+                workers.append(w)
+        return workers
+
     def get_timing_stats(self) -> dict[str, dict[str, float]]:
         """Return average timing per file extension for benchmarking display."""
         stats = {}
