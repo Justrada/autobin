@@ -268,6 +268,34 @@ class ProgressPanel(QWidget):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
+        # -- Queue-level progress bar with ETA --
+        queue_row = QHBoxLayout()
+        queue_row.setSpacing(8)
+        self._queue_label = QLabel("Queue")
+        self._queue_label.setObjectName("heading")
+        queue_row.addWidget(self._queue_label)
+
+        self._queue_bar = QProgressBar()
+        self._queue_bar.setFixedHeight(16)
+        self._queue_bar.setTextVisible(True)
+        self._queue_bar.setFormat("%v / %m clips")
+        self._queue_bar.setValue(0)
+        queue_row.addWidget(self._queue_bar, stretch=1)
+
+        self._eta_label = QLabel("")
+        self._eta_label.setObjectName("dimLabel")
+        self._eta_label.setFixedWidth(100)
+        self._eta_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        queue_row.addWidget(self._eta_label)
+
+        root.addLayout(queue_row)
+
+        # -- Separator --
+        sep_q = QLabel()
+        sep_q.setFixedHeight(1)
+        sep_q.setStyleSheet(f"background: {_BORDER};")
+        root.addWidget(sep_q)
+
         # -- Current video heading --
         self.current_label = QLabel("Idle")
         self.current_label.setObjectName("heading")
@@ -376,17 +404,36 @@ class ProgressPanel(QWidget):
             light.set_idle()
         self._active_step = None
 
+    def set_queue_progress(self, completed: int, total: int, est_remaining_s: float):
+        """Update the queue-level progress bar and ETA countdown."""
+        self._queue_bar.setMaximum(total)
+        self._queue_bar.setValue(completed)
+        if est_remaining_s > 0:
+            m, s = divmod(int(est_remaining_s), 60)
+            h, m = divmod(m, 60)
+            if h > 0:
+                self._eta_label.setText(f"~{h}h {m}m left")
+            elif m > 0:
+                self._eta_label.setText(f"~{m}m {s}s left")
+            else:
+                self._eta_label.setText(f"~{s}s left")
+        else:
+            self._eta_label.setText("")
+
     def set_idle(self):
         self.current_label.setText("Idle")
         self.frame_progress.setValue(0)
         self.transcript_progress.setValue(0)
         self.llm_progress.setValue(0)
+        self._queue_bar.setValue(0)
+        self._eta_label.setText("")
         for light in self._lights.values():
             light.set_idle()
         self._active_step = None
 
     def set_complete(self):
         self.current_label.setText("Queue complete")
+        self._eta_label.setText("Done")
         # Mark any still-working step as done
         if self._active_step and self._active_step in self._lights:
             self._lights[self._active_step].set_done()

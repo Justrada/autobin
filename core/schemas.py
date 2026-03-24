@@ -54,6 +54,16 @@ class ClipRefinement(BaseModel):
     content_tags: list[str] = Field(description="3-8 topical tags from the transcript")
 
 
+class IngestSettings_TimeBudget(BaseModel):
+    """Per-file-type timing data collected during processing."""
+    avg_frame_extraction_s: float = 0.0
+    avg_transcription_s: float = 0.0
+    avg_classification_s: float = 0.0
+    avg_llm_s: float = 0.0
+    avg_total_s: float = 0.0
+    sample_count: int = 0
+
+
 class ExportSettings(BaseModel):
     format: str = "csv"            # csv | fcpxml | resolve-api
     output_folder: str = ""        # centralized output folder for all CSVs (empty = prompt on first run)
@@ -133,6 +143,17 @@ class AudioCheckResult(BaseModel):
     speech_ratio: float = 0.0
 
 
+class StepTiming(BaseModel):
+    """Timing data for each pipeline step."""
+    audio_check_s: float = 0.0
+    classification_s: float = 0.0
+    frame_extraction_s: float = 0.0
+    transcription_s: float = 0.0
+    llm_s: float = 0.0
+    refinement_s: float = 0.0
+    total_s: float = 0.0
+
+
 class VideoResult(BaseModel):
     """Complete result for one processed video."""
     video_path: str
@@ -146,3 +167,5 @@ class VideoResult(BaseModel):
     multicam_group_id: str | None = None
     frame_count: int = 0
     duration_seconds: float = 0.0
+    timing: StepTiming = Field(default_factory=StepTiming)
+    file_extension: str = ""

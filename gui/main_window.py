@@ -109,6 +109,7 @@ class MainWindow(QMainWindow):
         o = self._orchestrator
         o.log.connect(self.progress_panel.log)
         o.video_started.connect(self._on_video_started)
+        o.video_skipped.connect(self._on_video_skipped)
         o.frame_progress.connect(self._on_frame_progress)
         o.transcript_progress.connect(self._on_transcript_progress)
         o.llm_progress.connect(self._on_llm_progress)
@@ -123,6 +124,7 @@ class MainWindow(QMainWindow):
         o.video_error.connect(self._on_video_error)
         o.multicam_groups_found.connect(self._on_multicam_groups_found)
         o.queue_completed.connect(self._on_queue_completed)
+        o.queue_progress.connect(self._on_queue_progress)
 
     def _ensure_output_folder(self) -> bool:
         """Make sure an output folder is set. Prompt if not."""
@@ -206,6 +208,16 @@ class MainWindow(QMainWindow):
         self.progress_panel.log(f"[commit] User edits saved for clip {index + 1}")
 
     # -- Orchestrator signal handlers --
+
+    def _on_video_skipped(self, index: int, path: str):
+        """Video was skipped because CSV already exists (resume mode)."""
+        name = os.path.basename(path)
+        self.queue_panel.set_item_status(index, "[SKIP]")
+        self.progress_panel.log(f"[skip] {name} already processed, skipping")
+
+    def _on_queue_progress(self, completed: int, total: int, est_remaining: float):
+        """Update the queue-level progress bar and ETA."""
+        self.progress_panel.set_queue_progress(completed, total, est_remaining)
 
     def _on_video_started(self, index: int, path: str):
         self._active_index = index
@@ -298,6 +310,22 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.progress_panel.set_complete()
         self.progress_panel.log("All videos processed.")
+
+        # Show timing stats per file type
+        stats = self._orchestrator.get_timing_stats()
+        if stats:
+            self.progress_panel.log("\n" + "=" * 50)
+            self.progress_panel.log("Timing stats by file type:")
+            self.progress_panel.log("=" * 50)
+            for ext, s in stats.items():
+                self.progress_panel.log(
+                    f"  {ext or '(no ext)'} ({int(s['count'])} clips): "
+                    f"avg total={s['avg_total']:.1f}s | "
+                    f"frames={s['avg_frame_extraction']:.1f}s | "
+                    f"transcribe={s['avg_transcription']:.1f}s | "
+                    f"llm={s['avg_llm']:.1f}s | "
+                    f"refine={s['avg_refinement']:.1f}s"
+                )
 
     # -- Settings persistence --
 

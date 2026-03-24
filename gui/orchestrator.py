@@ -5,13 +5,14 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import time
 
 from PySide6.QtCore import QObject, Signal
 
 from core.resolve_export import export_csv, export_combined_csv
 from core.schemas import (
     AppSettings, AudioCheckResult, ClipClassification, ClipRefinement,
-    MultiCamGroup, TranscriptSummary, UserOverrides, VideoResult,
+    MultiCamGroup, StepTiming, TranscriptSummary, UserOverrides, VideoResult,
 )
 from gui.workers import (
     AudioCheckWorker,
@@ -28,6 +29,7 @@ class PipelineOrchestrator(QObject):
     # Signals for GUI updates
     log = Signal(str)
     video_started = Signal(int, str)             # queue_index, video_path
+    video_skipped = Signal(int, str)             # queue_index, video_path (already done)
     frame_progress = Signal(int, int)
     transcript_progress = Signal(int, int)
     llm_progress = Signal(int, int)
@@ -42,6 +44,7 @@ class PipelineOrchestrator(QObject):
     video_error = Signal(int, str)                # queue_index, error_msg
     multicam_groups_found = Signal(list)          # list of MultiCamGroup
     queue_completed = Signal()
+    queue_progress = Signal(int, int, float)      # completed, total, est_remaining_s
 
     def __init__(self, settings: AppSettings, parent=None):
         super().__init__(parent)
@@ -62,6 +65,21 @@ class PipelineOrchestrator(QObject):
         self._transcript_done = False
         self._classify_done = False
 
+        # Step timing for current video
+        self._step_timing = StepTiming()
+        self._video_start_time: float = 0.0
+        self._audio_check_start: float = 0.0
+        self._classify_start: float = 0.0
+        self._frames_start: float = 0.0
+        self._transcribe_start: float = 0.0
+        self._llm_start: float = 0.0
+        self._refine_start: float = 0.0
+
+        # Queue-level timing for ETA
+        self._completed_count = 0
+        self._completed_times: list[float] = []   # seconds per completed video
+        self._timing_by_ext: dict[str, list[StepTiming]] = {}  # extension -> timings
+
         # Store completed results for click-to-view
         self._results: dict[int, VideoResult] = {}
 
@@ -71,6 +89,8 @@ class PipelineOrchestrator(QObject):
         self._current_index = 0
         self._results.clear()
         self._folder_tags_map = folder_tags_map or {}
+        self._completed_count = 0
+        self._completed_times.clear()
 
     def get_result(self, index: int) -> VideoResult | None:
         """Get completed result for a queue index (for click-to-view)."""
@@ -81,6 +101,8 @@ class PipelineOrchestrator(QObject):
             return
         self._running = True
         self._current_index = 0
+        self._completed_count = 0
+        self._completed_times.clear()
         self._process_next()
 
     def stop(self):
@@ -89,6 +111,15 @@ class PipelineOrchestrator(QObject):
     def _get_output_folder(self) -> str:
         """Return the centralized output folder for CSVs."""
         return self.settings.export.output_folder
+
+    def _csv_exists_for(self, video_path: str) -> bool:
+        """Check if a CSV has already been exported for this video."""
+        output_folder = self._get_output_folder()
+        if not output_folder:
+            return False
+        video_name = os.path.splitext(os.path.basename(video_path))[0]
+        csv_path = os.path.join(output_folder, f"{video_name}.csv")
+        return os.path.isfile(csv_path)
 
     def apply_overrides(self, index: int, overrides: UserOverrides):
         """Apply user overrides to a completed result and re-export CSV."""
@@ -225,6 +256,14 @@ class PipelineOrchestrator(QObject):
         export_combined_csv(results, combined_path)
         self.log.emit(f"[export] Combined CSV saved: {combined_path} ({len(results)} clips)")
 
+    def _estimate_remaining(self) -> float:
+        """Estimate remaining seconds based on average per-video time."""
+        if not self._completed_times:
+            return 0.0
+        avg = sum(self._completed_times) / len(self._completed_times)
+        remaining_count = len(self._queue) - self._current_index
+        return avg * remaining_count
+
     def _process_next(self):
         if not self._running or self._current_index >= len(self._queue):
             self._export_combined_csv()
@@ -241,6 +280,18 @@ class PipelineOrchestrator(QObject):
             return
 
         video_path = self._queue[self._current_index]
+
+        # --- Resume support: skip if CSV already exists ---
+        if self._csv_exists_for(video_path):
+            self.log.emit(f"[skip] CSV already exists for {os.path.basename(video_path)}")
+            self.video_skipped.emit(self._current_index, video_path)
+            self._completed_count += 1
+            est = self._estimate_remaining()
+            self.queue_progress.emit(self._completed_count, len(self._queue), est)
+            self._current_index += 1
+            self._process_next()
+            return
+
         self.video_started.emit(self._current_index, video_path)
         self.log.emit(f"\n{'='*50}")
         self.log.emit(f"Processing: {os.path.basename(video_path)}")
@@ -257,10 +308,15 @@ class PipelineOrchestrator(QObject):
         self._transcript_done = False
         self._classify_done = False
 
+        # Reset step timing
+        self._step_timing = StepTiming()
+        self._video_start_time = time.monotonic()
+
         # Temp dir for frames (cleaned up after LLM processing)
         self._temp_frames_dir = tempfile.mkdtemp(prefix="framex_")
 
         # Start audio check + classification in parallel (both are fast)
+        self._classify_start = time.monotonic()
         self._classify_worker = ClipClassificationWorker(
             video_path, self.settings, keep_frames=True
         )
@@ -270,6 +326,7 @@ class PipelineOrchestrator(QObject):
         self._classify_worker.start()
 
         if self.settings.transcription.audio_check:
+            self._audio_check_start = time.monotonic()
             self._audio_worker = AudioCheckWorker(video_path, self.settings)
             self._audio_worker.log.connect(self.log.emit)
             self._audio_worker.finished.connect(self._on_audio_check_done)
@@ -281,6 +338,7 @@ class PipelineOrchestrator(QObject):
 
     def _start_transcription(self, video_path: str):
         """Launch the transcription worker."""
+        self._transcribe_start = time.monotonic()
         self._transcript_worker = TranscriptionWorker(video_path, self.settings)
         self._transcript_worker.log.connect(self.log.emit)
         self._transcript_worker.progress.connect(self.transcript_progress.emit)
@@ -289,17 +347,22 @@ class PipelineOrchestrator(QObject):
         self._transcript_worker.start()
 
     def _on_audio_check_done(self, result: dict):
+        self._step_timing.audio_check_s = time.monotonic() - self._audio_check_start
         self._audio_check_result = AudioCheckResult(**result)
         video_path = self._queue[self._current_index]
 
         if result.get("has_audio", False):
             self._start_transcription(video_path)
         else:
-            self.log.emit("[orchestrator] No usable audio — skipping transcription")
-            self._transcript = ""
-            self._transcript_done = True
-            self.transcript_text_done.emit("")
-            self._check_ready_for_llm()
+            # BUG FIX: Always transcribe anyway, just log the warning.
+            # The audio check being negative doesn't mean the transcript is useless —
+            # 360 cameras and other sources may have speech that fails the
+            # speech-ratio check due to ambient noise characteristics.
+            # We still transcribe and let the downstream length checks
+            # (len > 20 for refinement, strip() for summary) decide.
+            self.log.emit("[orchestrator] Audio check: low/no speech detected. "
+                          "Transcribing anyway (downstream checks will filter).")
+            self._start_transcription(video_path)
 
     def _on_audio_check_error(self, msg: str):
         self.log.emit(f"[warning] Audio check failed: {msg} — transcribing anyway")
@@ -307,6 +370,7 @@ class PipelineOrchestrator(QObject):
         self._start_transcription(video_path)
 
     def _on_classify_done(self, result: ClipClassification | None, frame_paths: list[str]):
+        self._step_timing.classification_s = time.monotonic() - self._classify_start
         self._classification = result
         self._classify_frame_paths = frame_paths
         self._classify_done = True
@@ -315,7 +379,7 @@ class PipelineOrchestrator(QObject):
         if result and self._audio_check_result and not self._audio_check_result.has_audio:
             result.is_talking_head = False
             result.roll_type = "b-roll"
-            self.log.emit("[orchestrator] No usable audio — overriding to b-roll")
+            self.log.emit("[orchestrator] Low audio level — defaulting to b-roll")
 
         self.classification_done.emit(result)
 
@@ -332,6 +396,7 @@ class PipelineOrchestrator(QObject):
             self.frames_available.emit(list(frame_paths))
             self._check_ready_for_llm()
         else:
+            self._frames_start = time.monotonic()
             self._frame_worker = FrameExtractionWorker(
                 video_path, self.settings,
                 os.path.join(self._temp_frames_dir, "frames")
@@ -349,6 +414,7 @@ class PipelineOrchestrator(QObject):
         self.classification_done.emit(None)
 
         video_path = self._queue[self._current_index]
+        self._frames_start = time.monotonic()
         self._frame_worker = FrameExtractionWorker(
             video_path, self.settings,
             os.path.join(self._temp_frames_dir, "frames")
@@ -360,6 +426,7 @@ class PipelineOrchestrator(QObject):
         self._frame_worker.start()
 
     def _on_frames_done(self, paths: list[str]):
+        self._step_timing.frame_extraction_s = time.monotonic() - self._frames_start
         self._frame_paths = paths
         self._frames_done = True
         self.frame_count_update.emit(len(paths))
@@ -374,6 +441,7 @@ class PipelineOrchestrator(QObject):
         self._check_ready_for_llm()
 
     def _on_transcript_done(self, text: str):
+        self._step_timing.transcription_s = time.monotonic() - self._transcribe_start
         self._transcript = text
         self._transcript_done = True
         self.transcript_text_done.emit(text)
@@ -397,6 +465,7 @@ class PipelineOrchestrator(QObject):
             return
 
         self.log.emit("[orchestrator] Starting LLM pipeline...")
+        self._llm_start = time.monotonic()
         self._llm_worker = LLMWorker(
             self._transcript, self._frame_paths, self.settings
         )
@@ -407,12 +476,14 @@ class PipelineOrchestrator(QObject):
         self._llm_worker.start()
 
     def _on_llm_done(self, summary, keywords: list[str]):
+        self._step_timing.llm_s = time.monotonic() - self._llm_start
         if summary:
             self.transcript_summary_done.emit(summary)
         self.keywords_done.emit(keywords)
 
         if self._classification and self._transcript and len(self._transcript.strip()) > 20:
             self.log.emit("[orchestrator] Refining classification with transcript...")
+            self._refine_start = time.monotonic()
             self._refine_worker = ClipRefinementWorker(
                 self._transcript, self._classification, self.settings
             )
@@ -429,6 +500,7 @@ class PipelineOrchestrator(QObject):
 
     def _on_refinement_done(self, refinement: ClipRefinement | None,
                             summary: TranscriptSummary | None, keywords: list[str]):
+        self._step_timing.refinement_s = time.monotonic() - self._refine_start
         self._refinement = refinement
         if refinement:
             self.refinement_done.emit(refinement)
@@ -451,6 +523,9 @@ class PipelineOrchestrator(QObject):
     def _finalize_video(self, summary: TranscriptSummary | None, keywords: list[str]):
         video_path = self._queue[self._current_index]
 
+        # Finalize total timing
+        self._step_timing.total_s = time.monotonic() - self._video_start_time
+
         from core.frames import get_video_info
         info = get_video_info(video_path)
 
@@ -470,6 +545,8 @@ class PipelineOrchestrator(QObject):
                         self._refinement.content_tags.append(tag)
                         existing_tags_lower.add(tag.lower())
 
+        ext = os.path.splitext(video_path)[1].lower()
+
         result = VideoResult(
             video_path=video_path,
             transcript=self._transcript,
@@ -481,10 +558,36 @@ class PipelineOrchestrator(QObject):
             folder_tags=folder_tags,
             frame_count=len(self._frame_paths),
             duration_seconds=info.get("duration", 0),
+            timing=self._step_timing,
+            file_extension=ext,
         )
 
         # Store result for click-to-view
         self._results[self._current_index] = result
+
+        # Record timing for ETA and per-extension stats
+        self._completed_count += 1
+        self._completed_times.append(self._step_timing.total_s)
+        if ext not in self._timing_by_ext:
+            self._timing_by_ext[ext] = []
+        self._timing_by_ext[ext].append(self._step_timing)
+
+        # Log timing summary
+        t = self._step_timing
+        self.log.emit(
+            f"[timing] {os.path.basename(video_path)}: "
+            f"total={t.total_s:.1f}s | "
+            f"audio={t.audio_check_s:.1f}s | "
+            f"classify={t.classification_s:.1f}s | "
+            f"frames={t.frame_extraction_s:.1f}s | "
+            f"transcribe={t.transcription_s:.1f}s | "
+            f"llm={t.llm_s:.1f}s | "
+            f"refine={t.refinement_s:.1f}s"
+        )
+
+        # Emit queue-level progress with ETA
+        est = self._estimate_remaining()
+        self.queue_progress.emit(self._completed_count, len(self._queue), est)
 
         # Export CSV to centralized output folder
         output_folder = self._get_output_folder()
@@ -509,3 +612,22 @@ class PipelineOrchestrator(QObject):
 
         self._current_index += 1
         self._process_next()
+
+    def get_timing_stats(self) -> dict[str, dict[str, float]]:
+        """Return average timing per file extension for benchmarking display."""
+        stats = {}
+        for ext, timings in self._timing_by_ext.items():
+            n = len(timings)
+            if n == 0:
+                continue
+            stats[ext] = {
+                "count": n,
+                "avg_total": sum(t.total_s for t in timings) / n,
+                "avg_audio_check": sum(t.audio_check_s for t in timings) / n,
+                "avg_classification": sum(t.classification_s for t in timings) / n,
+                "avg_frame_extraction": sum(t.frame_extraction_s for t in timings) / n,
+                "avg_transcription": sum(t.transcription_s for t in timings) / n,
+                "avg_llm": sum(t.llm_s for t in timings) / n,
+                "avg_refinement": sum(t.refinement_s for t in timings) / n,
+            }
+        return stats
