@@ -30,6 +30,7 @@ from gui.queue_panel import QueuePanel
 from gui.settings_panel import SettingsPanel
 
 SETTINGS_PATH = os.path.expanduser("~/.config/vlm_iframe/settings.json")
+QUEUE_STATE_PATH = os.path.expanduser("~/.config/vlm_iframe/queue_state.json")
 
 
 class MainWindow(QMainWindow):
@@ -45,6 +46,9 @@ class MainWindow(QMainWindow):
 
         self._active_index: int = -1
         self._multicam_groups: list = []
+
+        # Restore previous queue if one was saved
+        self._restore_queue_state()
 
     def _build_ui(self):
         central = QWidget()
@@ -343,7 +347,85 @@ class MainWindow(QMainWindow):
         with open(SETTINGS_PATH, "w") as f:
             f.write(self._settings.model_dump_json(indent=2))
 
+    # -- Queue state persistence --
+
+    def _save_queue_state(self):
+        """Save the current queue to disk so it survives app restarts."""
+        items = []
+        for i in range(self.queue_panel.list_widget.count()):
+            item = self.queue_panel.list_widget.item(i)
+            path = item.data(256)   # ROLE_PATH
+            tags = item.data(257)   # ROLE_FOLDER_TAGS
+            # Check if this clip was completed (has [OK] or [SKIP] prefix)
+            text = item.text()
+            done = text.startswith("[OK]") or text.startswith("[SKIP]")
+            items.append({
+                "path": path,
+                "folder_tags": tags or [],
+                "done": done,
+            })
+
+        state = {"items": items}
+        os.makedirs(os.path.dirname(QUEUE_STATE_PATH), exist_ok=True)
+        with open(QUEUE_STATE_PATH, "w") as f:
+            json.dump(state, f, indent=2)
+
+    def _restore_queue_state(self):
+        """Reload the queue from a previous session."""
+        if not os.path.isfile(QUEUE_STATE_PATH):
+            return
+
+        try:
+            with open(QUEUE_STATE_PATH) as f:
+                state = json.load(f)
+        except Exception:
+            return
+
+        items = state.get("items", [])
+        if not items:
+            return
+
+        # Filter out files that no longer exist on disk
+        valid = [it for it in items if os.path.isfile(it["path"])]
+        if not valid:
+            return
+
+        from gui.queue_panel import ROLE_PATH, ROLE_FOLDER_TAGS
+        from PySide6.QtWidgets import QListWidgetItem
+
+        self.queue_panel.list_widget.setUpdatesEnabled(False)
+        for it in valid:
+            path = it["path"]
+            folder_tags = it.get("folder_tags", [])
+            done = it.get("done", False)
+
+            # Skip duplicates
+            if path in self.queue_panel._existing_paths:
+                continue
+
+            display = os.path.basename(path)
+            if folder_tags:
+                tag_prefix = "/".join(folder_tags[-2:])
+                display = f"[{tag_prefix}] {display}"
+
+            # Mark previously completed items
+            if done:
+                display = f"[OK] {display}"
+
+            item = QListWidgetItem(display)
+            item.setData(ROLE_PATH, path)
+            item.setData(ROLE_FOLDER_TAGS, folder_tags)
+            item.setToolTip(
+                f"{path}\nTags: {', '.join(folder_tags)}" if folder_tags else path
+            )
+            self.queue_panel.list_widget.addItem(item)
+            self.queue_panel._existing_paths.add(path)
+
+        self.queue_panel.list_widget.setUpdatesEnabled(True)
+        self.queue_panel._update_header()
+
     def closeEvent(self, event):
         self._settings = self.settings_panel.save_to_settings()
         self._save_settings()
+        self._save_queue_state()
         super().closeEvent(event)
