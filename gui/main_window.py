@@ -143,12 +143,43 @@ class MainWindow(QMainWindow):
         self.start_btn.clicked.connect(self._start_processing)
         btn_row.addWidget(self.start_btn)
 
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.setToolTip("Pause after current clip finishes")
+        self.pause_btn.clicked.connect(self._toggle_pause)
+        btn_row.addWidget(self.pause_btn)
+
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setEnabled(False)
+        self.stop_btn.setToolTip("Stop after current clip finishes (no new clips)")
         self.stop_btn.clicked.connect(self._stop_processing)
         btn_row.addWidget(self.stop_btn)
 
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setToolTip("Cancel current clip immediately and skip to next")
+        self.cancel_btn.setStyleSheet("color: #ff6666;")
+        self.cancel_btn.clicked.connect(self._cancel_current)
+        btn_row.addWidget(self.cancel_btn)
+
         left_layout.addLayout(btn_row)
+
+        # Second row: retry failed
+        btn_row2 = QHBoxLayout()
+        self.retry_btn = QPushButton("Retry Failed")
+        self.retry_btn.setEnabled(False)
+        self.retry_btn.setToolTip("Re-process all clips that failed or timed out")
+        self.retry_btn.clicked.connect(self._retry_failed)
+        btn_row2.addWidget(self.retry_btn)
+
+        self.cancel_all_btn = QPushButton("Cancel All")
+        self.cancel_all_btn.setEnabled(False)
+        self.cancel_all_btn.setToolTip("Cancel current clip and stop the entire queue")
+        self.cancel_all_btn.setStyleSheet("color: #ff4444;")
+        self.cancel_all_btn.clicked.connect(self._cancel_all)
+        btn_row2.addWidget(self.cancel_all_btn)
+
+        left_layout.addLayout(btn_row2)
         splitter.addWidget(left)
 
         # Center: tabs (progress + settings)
@@ -197,6 +228,9 @@ class MainWindow(QMainWindow):
         o.video_error.connect(self._on_video_error)
         o.multicam_groups_found.connect(self._on_multicam_groups_found)
         o.queue_completed.connect(self._on_queue_completed)
+        o.video_failed.connect(self._on_video_failed)
+        o.paused.connect(self._on_paused)
+        o.resumed.connect(self._on_resumed)
         o.queue_progress.connect(self._on_queue_progress)
 
     def _ensure_output_folder(self) -> bool:
@@ -246,6 +280,11 @@ class MainWindow(QMainWindow):
 
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(True)
+        self.cancel_all_btn.setEnabled(True)
+        self.pause_btn.setEnabled(True)
+        self.pause_btn.setText("Pause")
+        self.retry_btn.setEnabled(False)
         self.tabs.setCurrentWidget(self.progress_panel)
         self.progress_panel.log("Starting pipeline...")
 
@@ -253,9 +292,48 @@ class MainWindow(QMainWindow):
 
     def _stop_processing(self):
         self._orchestrator.stop()
+        self._set_idle_buttons()
+        self.progress_panel.log("Stopped by user.")
+
+    def _cancel_current(self):
+        self._orchestrator.cancel_current()
+
+    def _cancel_all(self):
+        self._orchestrator.cancel_all()
+        self._set_idle_buttons()
+
+    def _toggle_pause(self):
+        if self._orchestrator.is_paused:
+            self._orchestrator.resume()
+        else:
+            self._orchestrator.pause()
+
+    def _retry_failed(self):
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(True)
+        self.cancel_all_btn.setEnabled(True)
+        self.pause_btn.setEnabled(True)
+        self.pause_btn.setText("Pause")
+        self.retry_btn.setEnabled(False)
+        self._orchestrator.retry_failed()
+
+    def _set_idle_buttons(self):
+        """Reset all control buttons to idle state."""
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.progress_panel.log("Stopped by user.")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_all_btn.setEnabled(False)
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.setText("Pause")
+        # Enable retry if there are failed clips
+        self.retry_btn.setEnabled(bool(self._orchestrator.get_failed()))
+
+    def _on_paused(self):
+        self.pause_btn.setText("Resume")
+
+    def _on_resumed(self):
+        self.pause_btn.setText("Pause")
 
     # -- Queue click handler --
 
@@ -359,6 +437,11 @@ class MainWindow(QMainWindow):
         self.queue_panel.set_item_status(index, "[ERR]")
         self.progress_panel.log(f"[error] {msg}")
 
+    def _on_video_failed(self, index: int, path: str, reason: str):
+        """A clip was marked FAILED (timeout or cancelled)."""
+        self.queue_panel.set_item_status(index, "[FAIL]")
+        self.progress_panel.log(f"[FAIL] {os.path.basename(path)}: {reason}")
+
     def _on_multicam_groups_found(self, groups: list):
         """Store multicam groups and update the current metadata view."""
         self._multicam_groups = groups
@@ -379,10 +462,14 @@ class MainWindow(QMainWindow):
 
     def _on_queue_completed(self):
         self._active_index = -1
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
+        self._set_idle_buttons()
         self.progress_panel.set_complete()
-        self.progress_panel.log("All videos processed.")
+
+        failed = self._orchestrator.get_failed()
+        if failed:
+            self.progress_panel.log(f"All videos processed. {len(failed)} clip(s) FAILED — use Retry Failed to re-process.")
+        else:
+            self.progress_panel.log("All videos processed.")
 
         # Show timing stats per file type
         stats = self._orchestrator.get_timing_stats()

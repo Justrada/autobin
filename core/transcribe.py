@@ -110,12 +110,19 @@ def check_audio_level(video_path: str, threshold_db: float = -40.0,
         analyze_duration = min(duration, 1.0)
         start_time = 0
 
+    # Select best audio stream (avoid ambisonic on .360 files)
+    stream_map = _find_best_audio_stream(video_path)
+
     # Use ffmpeg astats to get RMS and peak levels
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-ss", str(start_time),
         "-i", video_path,
         "-t", str(analyze_duration),
+    ]
+    if stream_map:
+        cmd += ["-map", stream_map]
+    cmd += [
         "-vn", "-af", "astats=metadata=1:reset=0,ametadata=print:key=lavfi.astats.Overall.RMS_level:key=lavfi.astats.Overall.Peak_level",
         "-f", "null", "-",
     ]
@@ -152,6 +159,10 @@ def check_audio_level(video_path: str, threshold_db: float = -40.0,
             "-ss", str(start_time),
             "-i", video_path,
             "-t", str(analyze_duration),
+        ]
+        if stream_map:
+            cmd2 += ["-map", stream_map]
+        cmd2 += [
             "-vn", "-af", "volumedetect",
             "-f", "null", "-",
         ]
@@ -319,8 +330,94 @@ class TranscriptionBackend(ABC):
         ...
 
 
+def _find_python_with_mlx_whisper() -> str | None:
+    """Find a Python interpreter that has mlx-whisper installed.
+
+    Checks (in order):
+    1. .venv next to this source file (running from source)
+    2. .venv relative to the .app bundle location (PyInstaller)
+    3. The Python that launched this process
+    4. Common Homebrew / pyenv / system Python paths
+    5. ``python3`` on PATH
+    """
+    import shutil
+    import sys
+
+    candidates: list[str] = []
+
+    # 1. Walk up from this source file to find .venv
+    here = os.path.dirname(os.path.abspath(__file__))
+    for _i in range(5):  # walk up to 5 levels
+        venv_py = os.path.join(here, ".venv", "bin", "python")
+        if os.path.isfile(venv_py):
+            candidates.append(venv_py)
+            break
+        here = os.path.dirname(here)
+
+    # 2. Walk up from sys.executable (PyInstaller .app):
+    #    e.g. dist/AutoBin.app/Contents/MacOS/AutoBin → project root
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    for _i in range(6):
+        venv_py = os.path.join(exe_dir, ".venv", "bin", "python")
+        if os.path.isfile(venv_py):
+            if venv_py not in candidates:
+                candidates.append(venv_py)
+            break
+        exe_dir = os.path.dirname(exe_dir)
+
+    # 3. The Python that launched this process
+    if sys.executable and os.path.isfile(sys.executable):
+        candidates.append(sys.executable)
+
+    # 4. Common locations
+    home = os.path.expanduser("~")
+    extra_paths = [
+        os.path.join(home, "Documents", "VLM_I_FRAME_EXTRACTOR", ".venv", "bin", "python"),
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+    ]
+    # pyenv versions
+    pyenv_root = os.path.join(home, ".pyenv", "versions")
+    if os.path.isdir(pyenv_root):
+        try:
+            for ver_dir in sorted(os.listdir(pyenv_root), reverse=True):
+                py = os.path.join(pyenv_root, ver_dir, "bin", "python3")
+                if os.path.isfile(py):
+                    extra_paths.append(py)
+                    break
+        except OSError:
+            pass
+
+    for p in extra_paths:
+        if os.path.isfile(p) and p not in candidates:
+            candidates.append(p)
+
+    # 5. System python3 on PATH
+    sys_py = shutil.which("python3")
+    if sys_py and sys_py not in candidates:
+        candidates.append(sys_py)
+
+    for py in candidates:
+        try:
+            r = subprocess.run(
+                [py, "-c", "import mlx_whisper; print('ok')"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0 and "ok" in r.stdout:
+                return py
+        except Exception:
+            continue
+    return None
+
+
 class MLXWhisperBackend(TranscriptionBackend):
-    """Uses mlx-whisper for Apple Silicon optimized transcription."""
+    """Uses mlx-whisper for Apple Silicon optimized transcription.
+
+    First tries an in-process import.  If that fails (e.g. when running
+    inside a PyInstaller .app where native Metal libs can't be bundled),
+    falls back to running mlx-whisper in a subprocess using whichever
+    Python on the system has it installed.
+    """
 
     def __init__(self, model_size: str = "base"):
         self.model_size = model_size
@@ -328,25 +425,38 @@ class MLXWhisperBackend(TranscriptionBackend):
     def transcribe(self, audio_path: str, initial_prompt: str | None = None,
                    log: Callable[[str], None] | None = None) -> str:
         _log = log or (lambda m: None)
+
+        # --- Attempt 1: in-process import (works when running from source) ---
         try:
             import mlx_whisper
-        except ImportError:
-            _log("[transcribe] mlx-whisper not installed. Run: pip install mlx-whisper")
-            return ""
+            return self._transcribe_in_process(mlx_whisper, audio_path, initial_prompt, _log)
+        except ImportError as exc:
+            _log(f"[transcribe] In-process mlx-whisper unavailable ({exc}), trying subprocess...")
+        except Exception as exc:
+            _log(f"[transcribe] In-process mlx-whisper failed ({exc}), trying subprocess...")
 
-        _log(f"[transcribe] MLX-Whisper ({self.model_size}) processing...")
+        # --- Attempt 2: subprocess fallback (for .app bundles) ---
+        return self._transcribe_subprocess(audio_path, initial_prompt, _log)
+
+    # --------------------------------------------------------------------- #
+    def _transcribe_in_process(self, mlx_whisper, audio_path: str,
+                                initial_prompt: str | None,
+                                _log: Callable[[str], None]) -> str:
+        _log(f"[transcribe] MLX-Whisper ({self.model_size}) processing in-process...")
         if initial_prompt:
             _log(f"[transcribe] Vocabulary prompt: {initial_prompt[:80]}...")
 
-        # Use local model if downloaded, otherwise fall back to HF repo
         local_path = get_whisper_model_path(self.model_size)
         if is_whisper_model_downloaded(self.model_size):
             model_name = local_path
             _log(f"[transcribe] Using cached model: {local_path}")
         else:
-            model_name = MLX_WHISPER_MODELS.get(self.model_size,
-                         f"mlx-community/whisper-{self.model_size}-mlx")
-            _log(f"[transcribe] Downloading model from HuggingFace (first run)...")
+            model_name = MLX_WHISPER_MODELS.get(
+                self.model_size,
+                f"mlx-community/whisper-{self.model_size}-mlx",
+            )
+            _log("[transcribe] Downloading model from HuggingFace (first run)...")
+
         kwargs = {"path_or_hf_repo": model_name}
         if initial_prompt:
             kwargs["initial_prompt"] = initial_prompt
@@ -355,6 +465,62 @@ class MLXWhisperBackend(TranscriptionBackend):
         text = result.get("text", "").strip()
         _log(f"[transcribe] Got {len(text)} chars of transcript")
         return text
+
+    # --------------------------------------------------------------------- #
+    def _transcribe_subprocess(self, audio_path: str,
+                                initial_prompt: str | None,
+                                _log: Callable[[str], None]) -> str:
+        py = _find_python_with_mlx_whisper()
+        if not py:
+            _log("[transcribe] ✗ No Python with mlx-whisper found. "
+                 "Install it: pip install mlx-whisper")
+            return ""
+        _log(f"[transcribe] Using subprocess: {py}")
+
+        local_path = get_whisper_model_path(self.model_size)
+        if is_whisper_model_downloaded(self.model_size):
+            model_name = local_path
+        else:
+            model_name = MLX_WHISPER_MODELS.get(
+                self.model_size,
+                f"mlx-community/whisper-{self.model_size}-mlx",
+            )
+
+        # Build a small Python script to run transcription and print the text
+        script = (
+            "import json, sys, mlx_whisper\n"
+            f"kwargs = {{'path_or_hf_repo': {model_name!r}}}\n"
+        )
+        if initial_prompt:
+            script += f"kwargs['initial_prompt'] = {initial_prompt!r}\n"
+        script += (
+            f"result = mlx_whisper.transcribe({audio_path!r}, **kwargs)\n"
+            "print(json.dumps({'text': result.get('text', '')}))\n"
+        )
+
+        _log(f"[transcribe] MLX-Whisper ({self.model_size}) via subprocess...")
+        try:
+            proc = subprocess.run(
+                [py, "-c", script],
+                capture_output=True, text=True,
+                timeout=600,  # 10 min max for long clips
+            )
+            if proc.returncode != 0:
+                stderr_short = (proc.stderr or "")[:500]
+                _log(f"[transcribe] Subprocess failed (exit={proc.returncode}): {stderr_short}")
+                return ""
+
+            import json
+            data = json.loads(proc.stdout.strip().split("\n")[-1])
+            text = data.get("text", "").strip()
+            _log(f"[transcribe] Got {len(text)} chars of transcript")
+            return text
+        except subprocess.TimeoutExpired:
+            _log("[transcribe] Subprocess timed out (>10min)")
+            return ""
+        except Exception as exc:
+            _log(f"[transcribe] Subprocess error: {exc}")
+            return ""
 
 
 class FasterWhisperBackend(TranscriptionBackend):
@@ -393,19 +559,92 @@ def get_backend(settings: TranscriptionSettings) -> TranscriptionBackend:
         return MLXWhisperBackend(settings.model_size)
 
 
-def extract_audio(video_path: str, output_dir: str | None = None) -> str:
-    """Extract audio from video to a temporary WAV file using ffmpeg."""
+def _find_best_audio_stream(video_path: str) -> str | None:
+    """Probe for the first stereo/mono AAC or PCM audio stream (skip ambisonic).
+
+    GoPro .360 files have both a normal AAC track and an ambisonic
+    (4-channel) track.  ffmpeg's default stream selection sometimes picks
+    the ambisonic one, which the resampler can't handle.  This function
+    returns an ffmpeg map specifier like '0:1' for the first usable audio
+    stream, or None if only one audio stream exists (let ffmpeg decide).
+    """
+    probe_cmd = [
+        "ffprobe", "-hide_banner", "-loglevel", "error",
+        "-show_entries", "stream=index,codec_type,channels,codec_name",
+        "-select_streams", "a",
+        "-of", "csv=p=0",
+        video_path,
+    ]
+    try:
+        proc = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+        lines = [l.strip() for l in proc.stdout.strip().split("\n") if l.strip()]
+    except Exception:
+        return None
+
+    if len(lines) <= 1:
+        return None  # single audio stream, no need to force-select
+
+    # Output format: index,codec_name,codec_type,channels
+    # Prefer the first stream with <= 2 channels (stereo or mono)
+    for line in lines:
+        parts = line.split(",")
+        if len(parts) < 4:
+            continue
+        idx = parts[0]
+        channels_str = parts[-1]  # channels is always the last column
+        try:
+            channels = int(channels_str)
+        except ValueError:
+            continue
+        if channels <= 2:
+            return f"0:{idx}"
+
+    return None  # fallback: let ffmpeg decide
+
+
+def extract_audio(video_path: str, output_dir: str | None = None,
+                  log: Callable[[str], None] | None = None) -> str:
+    """Extract audio from video to a temporary WAV file using ffmpeg.
+
+    Automatically selects the first stereo/mono audio stream to avoid
+    ambisonic tracks on multi-stream files (e.g. GoPro .360).
+    """
+    _log = log or (lambda m: None)
     if output_dir is None:
         output_dir = tempfile.gettempdir()
     audio_path = os.path.join(output_dir, "audio.wav")
 
+    stream_map = _find_best_audio_stream(video_path)
+
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
         "-i", video_path,
+    ]
+    if stream_map:
+        cmd += ["-map", stream_map]
+        _log(f"[transcribe] Selecting audio stream {stream_map} (skipping ambisonic)")
+    cmd += [
         "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
         "-y", audio_path,
     ]
-    subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+
+    # Verify non-empty output
+    if not os.path.isfile(audio_path) or os.path.getsize(audio_path) == 0:
+        _log(f"[transcribe] Audio extraction produced empty file (ffmpeg exit={proc.returncode})")
+        if proc.stderr:
+            _log(f"[transcribe] ffmpeg: {proc.stderr[:300]}")
+        # Retry without stream map as fallback
+        if stream_map:
+            _log("[transcribe] Retrying without stream selection...")
+            cmd_fallback = [
+                "ffmpeg", "-hide_banner", "-loglevel", "warning",
+                "-i", video_path,
+                "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                "-y", audio_path,
+            ]
+            subprocess.run(cmd_fallback, capture_output=True, text=True)
+
     return audio_path
 
 
@@ -422,9 +661,9 @@ def transcribe_video(video_path: str, settings: TranscriptionSettings,
         _log(f"[transcribe] Custom vocabulary: {', '.join(vocab)}")
 
     with tempfile.TemporaryDirectory(prefix="transcribe_") as tmp:
-        audio_path = extract_audio(video_path, tmp)
-        if not os.path.isfile(audio_path):
-            _log("[transcribe] Failed to extract audio.")
+        audio_path = extract_audio(video_path, tmp, log=_log)
+        if not os.path.isfile(audio_path) or os.path.getsize(audio_path) == 0:
+            _log("[transcribe] Failed to extract audio (missing or empty).")
             return ""
 
         backend = get_backend(settings)

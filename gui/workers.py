@@ -3,17 +3,46 @@
 from __future__ import annotations
 
 import tempfile
+import time
 
 from PySide6.QtCore import QThread, Signal
 
-from core.frames import run_frame_pipeline
+from core.frames import run_frame_pipeline, sample_fast_frames, get_video_info
 from core.llm import classify_clip, refine_classification, run_llm_pipeline
 from core.multicam import find_multicam_groups
 from core.schemas import AppSettings, ClipClassification, ClipRefinement, TranscriptSummary, VideoResult
 from core.transcribe import check_audio_level, transcribe_video
 
 
-class AudioCheckWorker(QThread):
+# ---------------------------------------------------------------------------
+# Cancellable base class
+# ---------------------------------------------------------------------------
+
+class CancellableWorker(QThread):
+    """Base QThread with a cooperative cancellation flag.
+
+    Workers should periodically check ``self.is_cancelled`` and exit early
+    when it returns True.  The core functions can't check this directly,
+    but the long-running subprocess calls already have timeouts, and
+    :pymethod:`terminate` acts as a hard stop for truly stuck threads.
+    """
+
+    _cancelled: bool = False
+
+    def cancel(self):
+        """Request cooperative cancellation."""
+        self._cancelled = True
+
+    @property
+    def is_cancelled(self):
+        return self._cancelled
+
+
+# ---------------------------------------------------------------------------
+# Workers
+# ---------------------------------------------------------------------------
+
+class AudioCheckWorker(CancellableWorker):
     """Quick ffmpeg-based audio level check. Runs before transcription."""
     log = Signal(str)
     finished = Signal(dict)  # {has_audio, rms_db, peak_db, speech_ratio}
@@ -31,12 +60,14 @@ class AudioCheckWorker(QThread):
                 threshold_db=self.settings.transcription.noise_floor_db,
                 log=lambda msg: self.log.emit(msg),
             )
-            self.finished.emit(result)
+            if not self.is_cancelled:
+                self.finished.emit(result)
         except Exception as e:
-            self.error.emit(str(e))
+            if not self.is_cancelled:
+                self.error.emit(str(e))
 
 
-class ClipClassificationWorker(QThread):
+class ClipClassificationWorker(CancellableWorker):
     log = Signal(str)
     finished = Signal(object, list)  # (ClipClassification | None, frame_paths)
     error = Signal(str)
@@ -55,12 +86,14 @@ class ClipClassificationWorker(QThread):
                 log=lambda msg: self.log.emit(msg),
                 keep_frames=self.keep_frames,
             )
-            self.finished.emit(result, frame_paths)
+            if not self.is_cancelled:
+                self.finished.emit(result, frame_paths)
         except Exception as e:
-            self.error.emit(str(e))
+            if not self.is_cancelled:
+                self.error.emit(str(e))
 
 
-class ClipRefinementWorker(QThread):
+class ClipRefinementWorker(CancellableWorker):
     log = Signal(str)
     finished = Signal(object)  # ClipRefinement | None
     error = Signal(str)
@@ -80,12 +113,14 @@ class ClipRefinementWorker(QThread):
                 self.settings.llm,
                 log=lambda msg: self.log.emit(msg),
             )
-            self.finished.emit(result)
+            if not self.is_cancelled:
+                self.finished.emit(result)
         except Exception as e:
-            self.error.emit(str(e))
+            if not self.is_cancelled:
+                self.error.emit(str(e))
 
 
-class FrameExtractionWorker(QThread):
+class FrameExtractionWorker(CancellableWorker):
     log = Signal(str)
     progress = Signal(int, int)
     finished = Signal(list)  # list of frame paths
@@ -105,17 +140,20 @@ class FrameExtractionWorker(QThread):
                 output_dir=self.output_dir,
                 threshold=ingest.threshold,
                 target_fpm=ingest.target_fpm,
+                max_frames=ingest.max_frames,
+                time_budget=ingest.time_budget,
                 metric=ingest.metric,
-                offset=ingest.offset,
                 log=lambda msg: self.log.emit(msg),
                 progress=lambda cur, tot: self.progress.emit(cur, tot),
             )
-            self.finished.emit(saved)
+            if not self.is_cancelled:
+                self.finished.emit(saved)
         except Exception as e:
-            self.error.emit(str(e))
+            if not self.is_cancelled:
+                self.error.emit(str(e))
 
 
-class TranscriptionWorker(QThread):
+class TranscriptionWorker(CancellableWorker):
     log = Signal(str)
     progress = Signal(int, int)
     finished = Signal(str)  # transcript text
@@ -137,12 +175,14 @@ class TranscriptionWorker(QThread):
                 log=lambda msg: self.log.emit(msg),
             )
             self.progress.emit(1, 1)
-            self.finished.emit(text)
+            if not self.is_cancelled:
+                self.finished.emit(text)
         except Exception as e:
-            self.error.emit(str(e))
+            if not self.is_cancelled:
+                self.error.emit(str(e))
 
 
-class LLMWorker(QThread):
+class LLMWorker(CancellableWorker):
     log = Signal(str)
     progress = Signal(int, int)
     finished = Signal(object, list)  # (TranscriptSummary | None, keywords)
@@ -163,12 +203,47 @@ class LLMWorker(QThread):
                 log=lambda msg: self.log.emit(msg),
                 progress=lambda cur, tot: self.progress.emit(cur, tot),
             )
-            self.finished.emit(summary, keywords)
+            if not self.is_cancelled:
+                self.finished.emit(summary, keywords)
         except Exception as e:
-            self.error.emit(str(e))
+            if not self.is_cancelled:
+                self.error.emit(str(e))
 
 
-class MultiCamDetectionWorker(QThread):
+class FastFrameWorker(CancellableWorker):
+    """Grab N equidistant frames via seeking. Used in fast mode."""
+    log = Signal(str)
+    finished = Signal(list)  # list of frame paths
+    error = Signal(str)
+
+    def __init__(self, video_path: str, output_dir: str,
+                 n_frames: int = 5, max_width: int = 640):
+        super().__init__()
+        self.video_path = video_path
+        self.output_dir = output_dir
+        self.n_frames = n_frames
+        self.max_width = max_width
+
+    def run(self):
+        try:
+            info = get_video_info(self.video_path)
+            duration = info.get("duration", 0)
+            if duration <= 0:
+                self.error.emit("Could not determine video duration")
+                return
+            frames = sample_fast_frames(
+                self.video_path, self.output_dir, duration,
+                n_frames=self.n_frames, max_width=self.max_width,
+                log=lambda msg: self.log.emit(msg),
+            )
+            if not self.is_cancelled:
+                self.finished.emit(frames)
+        except Exception as e:
+            if not self.is_cancelled:
+                self.error.emit(str(e))
+
+
+class MultiCamDetectionWorker(CancellableWorker):
     """Post-queue worker that compares transcripts to find multi-cam groups."""
     log = Signal(str)
     progress = Signal(int, int)
@@ -188,6 +263,8 @@ class MultiCamDetectionWorker(QThread):
                 log=lambda msg: self.log.emit(msg),
                 progress=lambda cur, tot: self.progress.emit(cur, tot),
             )
-            self.finished.emit(groups)
+            if not self.is_cancelled:
+                self.finished.emit(groups)
         except Exception as e:
-            self.error.emit(str(e))
+            if not self.is_cancelled:
+                self.error.emit(str(e))

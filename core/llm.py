@@ -48,11 +48,17 @@ def _strip_schema_meta(schema_dict: dict) -> dict:
 def _clean_and_parse(content: str, schema: type[BaseModel]) -> BaseModel:
     """
     Try to parse LLM output as JSON. Handles common issues:
+    - Qwen3 <think>...</think> reasoning tags
     - Markdown code fences
     - Extra wrapping keys (e.g. {"description": {actual data}})
     - Non-JSON text mixed in
     """
     content = content.strip()
+
+    # Strip <think>...</think> tags (Qwen3 thinking mode)
+    # Must happen BEFORE JSON extraction — think blocks often contain
+    # curly braces that confuse the regex-based JSON finder.
+    content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
 
     # Strip markdown code fences
     content = re.sub(r"^```(?:json)?\s*\n?", "", content)
@@ -107,10 +113,11 @@ class LLMClient(ABC):
 # ---------------------------------------------------------------------------
 
 class OllamaClient(LLMClient):
-    def __init__(self, settings: LLMSettings):
+    def __init__(self, settings: LLMSettings, log: Callable[[str], None] | None = None):
         self.model = settings.model
         self.base_url = settings.base_url.rstrip("/")
         self.vlm_resolution = settings.vlm_input_resolution
+        self._log = log or (lambda m: None)
 
     def _encode_image(self, path: str) -> str:
         """Read and optionally downscale image, return base64."""
@@ -143,9 +150,11 @@ class OllamaClient(LLMClient):
             "stream": False,
             "think": False,
         }
+        self._log(f"[ollama] complete_text → {self.model} ({schema.__name__})")
         resp = requests.post(f"{self.base_url}/api/chat", json=payload, timeout=600)
         resp.raise_for_status()
         content = resp.json()["message"]["content"]
+        self._log(f"[ollama] raw response ({len(content)} chars): {content[:150]!r}")
         return _clean_and_parse(content, schema)
 
     def complete_vision(self, prompt: str, image_paths: list[str],
@@ -329,15 +338,16 @@ class AnthropicClient(LLMClient):
 # Factory
 # ---------------------------------------------------------------------------
 
-def get_client(settings: LLMSettings) -> LLMClient:
+def get_client(settings: LLMSettings,
+               log: Callable[[str], None] | None = None) -> LLMClient:
     if settings.backend == "ollama":
-        return OllamaClient(settings)
+        return OllamaClient(settings, log=log)
     elif settings.backend == "openai":
         return OpenAIClient(settings)
     elif settings.backend == "anthropic":
         return AnthropicClient(settings)
     else:
-        return OllamaClient(settings)
+        return OllamaClient(settings, log=log)
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +471,7 @@ def classify_clip(video_path: str, settings: LLMSettings,
         _log("[classify] Could not sample frames")
         return None, []
 
-    client = get_client(settings)
+    client = get_client(settings, log=_log)
     try:
         result = client.complete_vision(CLASSIFY_PROMPT, frame_paths, ClipClassification)
         _log(f"[classify] {result.roll_type.upper()} | {result.shot_type} | "
@@ -497,7 +507,7 @@ def refine_classification(transcript: str, classification: ClipClassification,
         return None
 
     _log("[refine] Refining classification with transcript context...")
-    client = get_client(settings)
+    client = get_client(settings, log=_log)
     prompt = REFINE_PROMPT.format(
         roll_type=classification.roll_type,
         subject=classification.subject,
@@ -527,20 +537,35 @@ def run_llm_pipeline(transcript: str, frame_paths: list[str],
     Returns (TranscriptSummary, deduplicated_keywords).
     """
     _log = log or (lambda m: None)
-    client = get_client(settings)
+    client = get_client(settings, log=_log)
 
     # Step 1: Summarize transcript
     summary = None
-    if transcript.strip():
-        _log("[llm] Step 1: Summarizing transcript...")
+    transcript_clean = transcript.strip()
+    if transcript_clean:
+        _log(f"[llm] Step 1: Summarizing transcript ({len(transcript_clean)} chars, "
+             f"first 80: {transcript_clean[:80]!r})...")
+        prompt_text = TRANSCRIPT_PROMPT.format(transcript=transcript_clean[:8000])
+
+        # Attempt 1
         try:
-            summary = client.complete_text(
-                TRANSCRIPT_PROMPT.format(transcript=transcript[:8000]),
-                TranscriptSummary,
-            )
-            _log(f"[llm] Summary: {summary.title}")
+            summary = client.complete_text(prompt_text, TranscriptSummary)
+            _log(f"[llm] Summary OK: \"{summary.title}\" | "
+                 f"{len(summary.summary)} char summary | "
+                 f"{len(summary.topics)} topics")
         except Exception as e:
-            _log(f"[llm] Transcript summary failed: {e}")
+            _log(f"[llm] Transcript summary attempt 1 failed: {e}")
+
+            # Attempt 2 — retry once (Ollama can be flaky on first call)
+            try:
+                _log("[llm] Retrying summary...")
+                summary = client.complete_text(prompt_text, TranscriptSummary)
+                _log(f"[llm] Summary OK (retry): \"{summary.title}\"")
+            except Exception as e2:
+                _log(f"[llm] Transcript summary attempt 2 failed: {e2}")
+    else:
+        _log(f"[llm] Step 1: Skipping summary — transcript is empty "
+             f"(raw len={len(transcript)}, stripped len={len(transcript_clean)})")
 
     # Step 2: Process image batches
     all_keywords: list[str] = []

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -70,9 +71,32 @@ class SettingsPanel(QWidget):
         self.metric_combo.addItems(["histogram", "ssim", "phash"])
         form.addRow("Metric:", self.metric_combo)
 
-        self.offset_spin = QSpinBox()
-        self.offset_spin.setRange(1, 60)
-        form.addRow("Frame Offset:", self.offset_spin)
+        self.max_frames_spin = QSpinBox()
+        self.max_frames_spin.setRange(4, 64)
+        self.max_frames_spin.setToolTip("Hard cap on frames sampled per clip")
+        form.addRow("Max Frames:", self.max_frames_spin)
+
+        self.time_budget_spin = QDoubleSpinBox()
+        self.time_budget_spin.setRange(2.0, 60.0)
+        self.time_budget_spin.setSingleStep(1.0)
+        self.time_budget_spin.setDecimals(0)
+        self.time_budget_spin.setSuffix("s")
+        self.time_budget_spin.setToolTip("Max seconds to spend sampling frames per clip")
+        form.addRow("Time Budget:", self.time_budget_spin)
+
+        # Fast mode toggle
+        self.fast_mode_cb = QCheckBox("Fast mode — fewer frames, tiny whisper, single LLM batch")
+        self.fast_mode_cb.setToolTip(
+            "Grabs equidistant frames (no similarity filtering).\n"
+            "Uses whisper-tiny for transcription and skips audio check.\n"
+            "Much faster but slightly less detailed metadata."
+        )
+        form.addRow("Fast Mode:", self.fast_mode_cb)
+
+        self.fast_frame_count_spin = QSpinBox()
+        self.fast_frame_count_spin.setRange(3, 32)
+        self.fast_frame_count_spin.setToolTip("Number of equidistant frames to grab in fast mode")
+        form.addRow("Fast Mode Frames:", self.fast_frame_count_spin)
 
         return w
 
@@ -164,7 +188,6 @@ class SettingsPanel(QWidget):
         form.addRow("", vocab_hint)
 
         # Audio check settings
-        from PySide6.QtWidgets import QCheckBox
         self.audio_check_cb = QCheckBox("Check audio level before transcribing")
         self.audio_check_cb.setToolTip("Skip transcription on silent/ambient-only clips to avoid hallucinated text")
         form.addRow("Audio Check:", self.audio_check_cb)
@@ -260,7 +283,10 @@ class SettingsPanel(QWidget):
             self.threshold_spin.setValue(s.ingest.threshold)
         self.target_fpm_spin.setValue(s.ingest.target_fpm)
         self.metric_combo.setCurrentText(s.ingest.metric)
-        self.offset_spin.setValue(s.ingest.offset)
+        self.max_frames_spin.setValue(s.ingest.max_frames)
+        self.time_budget_spin.setValue(s.ingest.time_budget)
+        self.fast_mode_cb.setChecked(s.ingest.fast_mode)
+        self.fast_frame_count_spin.setValue(s.ingest.fast_frame_count)
 
         # LLM
         self.llm_backend.setCurrentText(s.llm.backend)
@@ -294,7 +320,10 @@ class SettingsPanel(QWidget):
             s.ingest.threshold = self.threshold_spin.value()
         s.ingest.target_fpm = self.target_fpm_spin.value()
         s.ingest.metric = self.metric_combo.currentText()
-        s.ingest.offset = self.offset_spin.value()
+        s.ingest.max_frames = self.max_frames_spin.value()
+        s.ingest.time_budget = self.time_budget_spin.value()
+        s.ingest.fast_mode = self.fast_mode_cb.isChecked()
+        s.ingest.fast_frame_count = self.fast_frame_count_spin.value()
 
         # LLM
         s.llm.backend = self.llm_backend.currentText()

@@ -13,7 +13,10 @@ class IngestSettings(BaseModel):
     threshold: float | None = None  # None = auto-tune
     metric: str = "histogram"       # histogram | ssim | phash
     target_fpm: float = 4.0
-    offset: int = 10
+    max_frames: int = 16            # hard cap on sampled frames per clip
+    time_budget: float = 10.0       # max seconds to spend sampling frames
+    fast_mode: bool = False         # 5 equidistant frames, tiny whisper, single LLM batch
+    fast_frame_count: int = 5       # number of frames in fast mode
 
 
 class LLMSettings(BaseModel):

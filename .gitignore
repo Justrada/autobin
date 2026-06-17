@@ -34,9 +34,14 @@ env/
 *.avi
 *.mkv
 *.mxf
+*.LRV
 *_output/
 output_frames/
 TEST FOOTAGE/
+
+# Node (remotion experiments)
+node_modules/
+remotion/out/
 
 # Whisper model cache (downloaded at runtime)
 whisper_models/
