@@ -25,6 +25,15 @@ pydantic_submodules = collect_submodules("pydantic")
 # Collect skimage data files
 skimage_data = collect_data_files("skimage")
 
+# Collect mlx-whisper + mlx (Apple Silicon transcription)
+mlx_whisper_submodules = collect_submodules("mlx_whisper")
+mlx_submodules = collect_submodules("mlx")
+mlx_whisper_data = collect_data_files("mlx_whisper")
+mlx_data = collect_data_files("mlx")
+
+# Collect huggingface_hub (for model downloads)
+huggingface_submodules = collect_submodules("huggingface_hub")
+
 a = Analysis(
     ["main.py"],
     pathex=[],
@@ -32,10 +41,15 @@ a = Analysis(
     datas=[
         *pyside6_data,
         *skimage_data,
+        *mlx_whisper_data,
+        *mlx_data,
     ],
     hiddenimports=[
         *pyside6_submodules,
         *pydantic_submodules,
+        *mlx_whisper_submodules,
+        *mlx_submodules,
+        *huggingface_submodules,
         "core",
         "core.schemas",
         "core.frames",
@@ -59,6 +73,11 @@ a = Analysis(
         "requests",
         "skimage",
         "skimage.metrics",
+        "mlx",
+        "mlx.core",
+        "mlx.nn",
+        "mlx_whisper",
+        "huggingface_hub",
     ],
     hookspath=[],
     hooksconfig={},
@@ -67,7 +86,6 @@ a = Analysis(
         "tkinter",
         "matplotlib",
         "test",
-        "unittest",
         "IPython",
         "jupyter",
     ],

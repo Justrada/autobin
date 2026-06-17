@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import time
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 
 from core.resolve_export import export_csv, export_combined_csv
 from core.schemas import (
@@ -18,11 +18,15 @@ from gui.workers import (
     AudioCheckWorker,
     ClipClassificationWorker,
     ClipRefinementWorker,
+    FastFrameWorker,
     FrameExtractionWorker,
     LLMWorker,
     MultiCamDetectionWorker,
     TranscriptionWorker,
 )
+
+# Default per-video timeout: 10 minutes
+DEFAULT_VIDEO_TIMEOUT_S = 600
 
 
 class PipelineOrchestrator(QObject):
@@ -30,6 +34,7 @@ class PipelineOrchestrator(QObject):
     log = Signal(str)
     video_started = Signal(int, str)             # queue_index, video_path
     video_skipped = Signal(int, str)             # queue_index, video_path (already done)
+    video_failed = Signal(int, str, str)         # queue_index, video_path, reason
     frame_progress = Signal(int, int)
     transcript_progress = Signal(int, int)
     llm_progress = Signal(int, int)
@@ -45,6 +50,8 @@ class PipelineOrchestrator(QObject):
     multicam_groups_found = Signal(list)          # list of MultiCamGroup
     queue_completed = Signal()
     queue_progress = Signal(int, int, float)      # completed, total, est_remaining_s
+    paused = Signal()                             # emitted when pipeline pauses
+    resumed = Signal()                            # emitted when pipeline resumes
 
     def __init__(self, settings: AppSettings, parent=None):
         super().__init__(parent)
@@ -52,6 +59,14 @@ class PipelineOrchestrator(QObject):
         self._queue: list[str] = []
         self._current_index = 0
         self._running = False
+        self._paused = False
+        self._cancelling = False  # True during cancel-current-clip
+
+        # Failed clips: index → reason
+        self._failed: dict[int, str] = {}
+
+        # Per-video timeout (seconds). 0 = no timeout.
+        self.video_timeout_s: float = DEFAULT_VIDEO_TIMEOUT_S
 
         # Per-video state
         self._temp_frames_dir: str | None = None
@@ -64,6 +79,7 @@ class PipelineOrchestrator(QObject):
         self._frames_done = False
         self._transcript_done = False
         self._classify_done = False
+        self._llm_started = False
 
         # Step timing for current video
         self._step_timing = StepTiming()
@@ -83,11 +99,21 @@ class PipelineOrchestrator(QObject):
         # Store completed results for click-to-view
         self._results: dict[int, VideoResult] = {}
 
+        # Per-video watchdog timer (runs on the main/GUI thread)
+        self._watchdog = QTimer(self)
+        self._watchdog.setSingleShot(True)
+        self._watchdog.timeout.connect(self._on_video_timeout)
+
+    # ------------------------------------------------------------------
+    # Queue management
+    # ------------------------------------------------------------------
+
     def set_queue(self, video_paths: list[str],
                   folder_tags_map: dict[int, list[str]] | None = None):
         self._queue = list(video_paths)
         self._current_index = 0
         self._results.clear()
+        self._failed.clear()
         self._folder_tags_map = folder_tags_map or {}
         self._completed_count = 0
         self._completed_times.clear()
@@ -96,30 +122,214 @@ class PipelineOrchestrator(QObject):
         """Get completed result for a queue index (for click-to-view)."""
         return self._results.get(index)
 
+    def get_failed(self) -> dict[int, str]:
+        """Return dict of failed clip indices → reason strings."""
+        return dict(self._failed)
+
+    # ------------------------------------------------------------------
+    # Control: start / stop / cancel / pause / resume / retry
+    # ------------------------------------------------------------------
+
     def start(self):
         if not self._queue:
             return
         self._running = True
+        self._paused = False
+        self._cancelling = False
         self._current_index = 0
         self._completed_count = 0
         self._completed_times.clear()
+        self._failed.clear()
         self._process_next()
 
     def stop(self):
+        """Stop after the current clip finishes (no new clips started)."""
         self._running = False
+        self._paused = False
+        self._watchdog.stop()
+
+    def cancel_current(self):
+        """Cancel the current clip immediately → mark FAILED → move on."""
+        if not self._running:
+            return
+        self._cancelling = True
+        self._watchdog.stop()
+        self.log.emit("[cancel] Cancelling current clip...")
+        self._kill_active_workers()
+        # Mark as failed and advance
+        video_path = self._queue[self._current_index]
+        reason = "Cancelled by user"
+        self._failed[self._current_index] = reason
+        self.video_failed.emit(self._current_index, video_path, reason)
+        self.log.emit(f"[cancel] {os.path.basename(video_path)} marked as FAILED")
+        self._cleanup_temp()
+        self._cancelling = False
+        self._current_index += 1
+        self._completed_count += 1
+        est = self._estimate_remaining()
+        self.queue_progress.emit(self._completed_count, len(self._queue), est)
+        self._process_next()
+
+    def cancel_all(self):
+        """Cancel the current clip and stop the queue entirely."""
+        self._running = False
+        self._paused = False
+        self._cancelling = True
+        self._watchdog.stop()
+        self.log.emit("[cancel] Cancelling all processing...")
+        self._kill_active_workers()
+        # Mark current clip as failed if in progress
+        if self._current_index < len(self._queue):
+            video_path = self._queue[self._current_index]
+            reason = "Cancelled by user (cancel all)"
+            self._failed[self._current_index] = reason
+            self.video_failed.emit(self._current_index, video_path, reason)
+        self._cleanup_temp()
+        self._cancelling = False
+        # Emit remaining as failed? No — just stop. User can retry later.
+        self.queue_completed.emit()
+
+    def pause(self):
+        """Pause after the current clip finishes."""
+        if self._running and not self._paused:
+            self._paused = True
+            self.log.emit("[pause] Pipeline will pause after current clip finishes.")
+            self.paused.emit()
+
+    def resume(self):
+        """Resume a paused pipeline."""
+        if self._paused:
+            self._paused = False
+            self.log.emit("[resume] Pipeline resumed.")
+            self.resumed.emit()
+            self._process_next()
+
+    def retry_failed(self):
+        """Re-queue all failed clips and start processing."""
+        if not self._failed:
+            self.log.emit("[retry] No failed clips to retry.")
+            return
+        failed_indices = sorted(self._failed.keys())
+        self.log.emit(f"[retry] Retrying {len(failed_indices)} failed clip(s)...")
+        # Remove their CSVs so they don't get skipped
+        output_folder = self._get_output_folder()
+        for idx in failed_indices:
+            video_path = self._queue[idx]
+            if output_folder:
+                csv_path = os.path.join(output_folder, f"{self._csv_stem(video_path)}.csv")
+                if os.path.isfile(csv_path):
+                    os.remove(csv_path)
+        # Build a new queue of just the failed clips
+        retry_paths = [self._queue[i] for i in failed_indices]
+        retry_tags = {
+            new_i: self._folder_tags_map.get(old_i, [])
+            for new_i, old_i in enumerate(failed_indices)
+        }
+        self._failed.clear()
+        self.set_queue(retry_paths, retry_tags)
+        self._running = True
+        self._paused = False
+        self._process_next()
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    # ------------------------------------------------------------------
+    # Worker termination helpers
+    # ------------------------------------------------------------------
+
+    def _kill_active_workers(self):
+        """Cancel and wait for all active workers (with hard kill fallback)."""
+        workers = self.get_active_workers()
+        # First: cooperative cancel
+        for w in workers:
+            w.cancel()
+        # Wait up to 5s for graceful exit
+        for w in workers:
+            if w.isRunning():
+                w.wait(5000)
+        # Hard terminate anything still stuck
+        for w in workers:
+            if w.isRunning():
+                self.log.emit(f"[cancel] Force-terminating {type(w).__name__}")
+                w.terminate()
+                w.wait(2000)
+
+    def _cleanup_temp(self):
+        """Remove temp frames directory for the current clip."""
+        if self._temp_frames_dir and os.path.isdir(self._temp_frames_dir):
+            shutil.rmtree(self._temp_frames_dir, ignore_errors=True)
+        if self._classify_frame_paths:
+            tmp_dir = os.path.dirname(self._classify_frame_paths[0])
+            if os.path.isdir(tmp_dir) and tmp_dir.startswith(tempfile.gettempdir()):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # Watchdog (per-video timeout)
+    # ------------------------------------------------------------------
+
+    def _start_watchdog(self):
+        """Start the per-video timeout watchdog."""
+        if self.video_timeout_s > 0:
+            self._watchdog.start(int(self.video_timeout_s * 1000))
+
+    def _on_video_timeout(self):
+        """Fired when a clip exceeds the timeout. Mark FAILED and skip."""
+        if not self._running or self._current_index >= len(self._queue):
+            return
+        video_path = self._queue[self._current_index]
+        elapsed = time.monotonic() - self._video_start_time
+        reason = f"Timed out after {elapsed:.0f}s (limit: {self.video_timeout_s:.0f}s)"
+        self.log.emit(f"[timeout] {os.path.basename(video_path)}: {reason}")
+        self._kill_active_workers()
+        self._failed[self._current_index] = reason
+        self.video_failed.emit(self._current_index, video_path, reason)
+        self._cleanup_temp()
+        self._current_index += 1
+        self._completed_count += 1
+        est = self._estimate_remaining()
+        self.queue_progress.emit(self._completed_count, len(self._queue), est)
+        self._process_next()
+
+    # ------------------------------------------------------------------
+    # CSV helpers
+    # ------------------------------------------------------------------
 
     def _get_output_folder(self) -> str:
         """Return the centralized output folder for CSVs."""
         return self.settings.export.output_folder
+
+    @staticmethod
+    def _csv_stem(video_path: str) -> str:
+        """Build a unique CSV stem from a video path, including extension.
+
+        'GX010024.mov' → 'GX010024_mov'
+        'GX010024.360' → 'GX010024_360'
+        This prevents .mov/.LRV/.360 variants from overwriting each other.
+        """
+        base = os.path.basename(video_path)
+        name, ext = os.path.splitext(base)
+        ext_clean = ext.lstrip(".").lower()
+        if ext_clean:
+            return f"{name}_{ext_clean}"
+        return name
 
     def _csv_exists_for(self, video_path: str) -> bool:
         """Check if a CSV has already been exported for this video."""
         output_folder = self._get_output_folder()
         if not output_folder:
             return False
-        video_name = os.path.splitext(os.path.basename(video_path))[0]
-        csv_path = os.path.join(output_folder, f"{video_name}.csv")
+        csv_path = os.path.join(output_folder, f"{self._csv_stem(video_path)}.csv")
         return os.path.isfile(csv_path)
+
+    # ------------------------------------------------------------------
+    # Overrides
+    # ------------------------------------------------------------------
 
     def apply_overrides(self, index: int, overrides: UserOverrides):
         """Apply user overrides to a completed result and re-export CSV."""
@@ -188,14 +398,17 @@ class PipelineOrchestrator(QObject):
         # Re-export CSV
         output_folder = self._get_output_folder()
         if output_folder:
-            video_name = os.path.splitext(os.path.basename(result.video_path))[0]
-            csv_path = os.path.join(output_folder, f"{video_name}.csv")
+            csv_path = os.path.join(output_folder, f"{self._csv_stem(result.video_path)}.csv")
             export_csv(result, csv_path)
             self.log.emit(f"[export] CSV updated: {csv_path}")
 
             # Re-export combined CSV if all results exist
             if len(self._results) > 1:
                 self._export_combined_csv()
+
+    # ------------------------------------------------------------------
+    # Multi-cam
+    # ------------------------------------------------------------------
 
     def _run_multicam_detection(self):
         """Run multi-cam detection after all clips are processed."""
@@ -229,20 +442,25 @@ class PipelineOrchestrator(QObject):
             if output_folder:
                 for result in self._results.values():
                     if result.multicam_group_id:
-                        video_name = os.path.splitext(
-                            os.path.basename(result.video_path)
-                        )[0]
-                        csv_path = os.path.join(output_folder, f"{video_name}.csv")
+                        csv_path = os.path.join(
+                            output_folder,
+                            f"{self._csv_stem(result.video_path)}.csv",
+                        )
                         export_csv(result, csv_path)
 
         self.multicam_groups_found.emit(groups)
-        self.queue_completed.emit()
-        self._running = False
+        self._finish_queue()
 
     def _on_multicam_error(self, msg: str):
         self.log.emit(f"[warning] Multi-cam detection failed: {msg}")
-        self.queue_completed.emit()
+        self._finish_queue()
+
+    def _finish_queue(self):
+        """Final cleanup when the entire queue is done."""
+        self._watchdog.stop()
         self._running = False
+        self._paused = False
+        self.queue_completed.emit()
 
     def _export_combined_csv(self):
         """Write a single combined CSV with all completed results."""
@@ -256,6 +474,10 @@ class PipelineOrchestrator(QObject):
         export_combined_csv(results, combined_path)
         self.log.emit(f"[export] Combined CSV saved: {combined_path} ({len(results)} clips)")
 
+    # ------------------------------------------------------------------
+    # ETA
+    # ------------------------------------------------------------------
+
     def _estimate_remaining(self) -> float:
         """Estimate remaining seconds based on average per-video time."""
         if not self._completed_times:
@@ -264,9 +486,27 @@ class PipelineOrchestrator(QObject):
         remaining_count = len(self._queue) - self._current_index
         return avg * remaining_count
 
+    # ------------------------------------------------------------------
+    # Main pipeline loop
+    # ------------------------------------------------------------------
+
     def _process_next(self):
+        # Pause check — don't start next clip, but don't mark as done
+        if self._paused and self._running:
+            self.log.emit("[pause] Pipeline paused. Use Resume to continue.")
+            return
+
         if not self._running or self._current_index >= len(self._queue):
+            self._watchdog.stop()
             self._export_combined_csv()
+
+            # Log failed summary
+            if self._failed:
+                self.log.emit(f"\n[summary] {len(self._failed)} clip(s) FAILED:")
+                for idx, reason in sorted(self._failed.items()):
+                    name = os.path.basename(self._queue[idx]) if idx < len(self._queue) else f"#{idx}"
+                    self.log.emit(f"  - {name}: {reason}")
+
             # Run multi-cam detection if we have 2+ results with transcripts
             results_with_transcripts = [
                 r for r in self._results.values()
@@ -275,8 +515,7 @@ class PipelineOrchestrator(QObject):
             if len(results_with_transcripts) >= 2:
                 self._run_multicam_detection()
             else:
-                self.queue_completed.emit()
-                self._running = False
+                self._finish_queue()
             return
 
         video_path = self._queue[self._current_index]
@@ -307,39 +546,131 @@ class PipelineOrchestrator(QObject):
         self._frames_done = False
         self._transcript_done = False
         self._classify_done = False
+        self._llm_started = False
+        self._cancelling = False
 
         # Reset step timing
         self._step_timing = StepTiming()
         self._video_start_time = time.monotonic()
 
+        # Start per-video watchdog
+        self._start_watchdog()
+
         # Temp dir for frames (cleaned up after LLM processing)
         self._temp_frames_dir = tempfile.mkdtemp(prefix="framex_")
 
-        # Start audio check + classification in parallel (both are fast)
-        self._classify_start = time.monotonic()
-        self._classify_worker = ClipClassificationWorker(
-            video_path, self.settings, keep_frames=True
-        )
-        self._classify_worker.log.connect(self.log.emit)
-        self._classify_worker.finished.connect(self._on_classify_done)
-        self._classify_worker.error.connect(self._on_classify_error)
-        self._classify_worker.start()
+        fast_mode = self.settings.ingest.fast_mode
 
-        if self.settings.transcription.audio_check:
-            self._audio_check_start = time.monotonic()
-            self._audio_worker = AudioCheckWorker(video_path, self.settings)
-            self._audio_worker.log.connect(self.log.emit)
-            self._audio_worker.finished.connect(self._on_audio_check_done)
-            self._audio_worker.error.connect(self._on_audio_check_error)
-            self._audio_worker.start()
-        else:
-            # Skip audio check, go straight to transcription
+        if fast_mode:
+            # --- FAST MODE ---
+            # Grab 5 equidistant frames (used for classification + keywords)
+            # Classification runs on those same frames after they arrive
+            # Transcribe with tiny model in parallel
+            self.log.emit("[fast] Fast mode enabled — 5 frames, tiny whisper, single LLM batch")
+
+            self._frames_start = time.monotonic()
+            self._fast_frame_worker = FastFrameWorker(
+                video_path,
+                os.path.join(self._temp_frames_dir, "frames"),
+                n_frames=self.settings.ingest.fast_frame_count,
+                max_width=self.settings.llm.vlm_input_resolution,
+            )
+            self._fast_frame_worker.log.connect(self.log.emit)
+            self._fast_frame_worker.finished.connect(self._on_fast_frames_done)
+            self._fast_frame_worker.error.connect(self._on_frame_error)
+            self._fast_frame_worker.start()
+
+            # Start transcription in parallel (no audio check in fast mode)
             self._start_transcription(video_path)
+
+            # classify_done stays False — will be set when _on_fast_classify_done fires
+            # This prevents the LLM from firing before frames + classification are ready
+
+        else:
+            # --- NORMAL MODE ---
+            # Start audio check + classification in parallel (both are fast)
+            self._classify_start = time.monotonic()
+            self._classify_worker = ClipClassificationWorker(
+                video_path, self.settings, keep_frames=True
+            )
+            self._classify_worker.log.connect(self.log.emit)
+            self._classify_worker.finished.connect(self._on_classify_done)
+            self._classify_worker.error.connect(self._on_classify_error)
+            self._classify_worker.start()
+
+            if self.settings.transcription.audio_check:
+                self._audio_check_start = time.monotonic()
+                self._audio_worker = AudioCheckWorker(video_path, self.settings)
+                self._audio_worker.log.connect(self.log.emit)
+                self._audio_worker.finished.connect(self._on_audio_check_done)
+                self._audio_worker.error.connect(self._on_audio_check_error)
+                self._audio_worker.start()
+            else:
+                # Skip audio check, go straight to transcription
+                self._start_transcription(video_path)
+
+    # ------------------------------------------------------------------
+    # Fast-mode frame/classify handlers
+    # ------------------------------------------------------------------
+
+    def _on_fast_frames_done(self, paths: list[str]):
+        """Fast mode: 5 frames grabbed, used for both classification and keywords."""
+        if self._cancelling:
+            return
+        self._step_timing.frame_extraction_s = time.monotonic() - self._frames_start
+        self._frame_paths = paths
+        self._classify_frame_paths = paths
+        self._frames_done = True
+        self.frame_count_update.emit(len(paths))
+        self.frames_available.emit(paths)
+        self.log.emit(f"[fast] Got {len(paths)} frames for full pipeline")
+
+        # In fast mode, run classification on these same frames
+        if paths:
+            self._classify_start = time.monotonic()
+            self._fast_classify_worker = ClipClassificationWorker(
+                self._queue[self._current_index], self.settings,
+                keep_frames=False,  # we already have frames
+            )
+            self._fast_classify_worker.log.connect(self.log.emit)
+            self._fast_classify_worker.finished.connect(self._on_fast_classify_done)
+            self._fast_classify_worker.error.connect(self._on_classify_error)
+            self._fast_classify_worker.start()
+        else:
+            # No frames — mark classify as done so LLM gate opens
+            self._classify_done = True
+            self.log.emit("[fast] No frames extracted — skipping classification")
+            self._check_ready_for_llm()
+
+    def _on_fast_classify_done(self, result, frame_paths: list[str]):
+        """Fast mode classification done — don't replace our existing frames."""
+        if self._cancelling:
+            return
+        self._step_timing.classification_s = time.monotonic() - self._classify_start
+        self._classification = result
+        self._classify_done = True
+        self.classification_done.emit(result)
+        if result:
+            self.log.emit(f"[fast] Classification: {result.roll_type} | {result.shot_type}")
+        self._check_ready_for_llm()
+
+    # ------------------------------------------------------------------
+    # Normal-mode handlers
+    # ------------------------------------------------------------------
 
     def _start_transcription(self, video_path: str):
         """Launch the transcription worker."""
         self._transcribe_start = time.monotonic()
-        self._transcript_worker = TranscriptionWorker(video_path, self.settings)
+
+        # In fast mode, override to tiny whisper model
+        settings = self.settings
+        if settings.ingest.fast_mode:
+            from copy import deepcopy
+            settings = deepcopy(self.settings)
+            settings.transcription.model_size = "tiny"
+            self.log.emit("[fast] Using whisper-tiny for transcription")
+
+        self._transcript_worker = TranscriptionWorker(video_path, settings)
         self._transcript_worker.log.connect(self.log.emit)
         self._transcript_worker.progress.connect(self.transcript_progress.emit)
         self._transcript_worker.finished.connect(self._on_transcript_done)
@@ -347,6 +678,8 @@ class PipelineOrchestrator(QObject):
         self._transcript_worker.start()
 
     def _on_audio_check_done(self, result: dict):
+        if self._cancelling:
+            return
         self._step_timing.audio_check_s = time.monotonic() - self._audio_check_start
         self._audio_check_result = AudioCheckResult(**result)
         video_path = self._queue[self._current_index]
@@ -354,22 +687,20 @@ class PipelineOrchestrator(QObject):
         if result.get("has_audio", False):
             self._start_transcription(video_path)
         else:
-            # BUG FIX: Always transcribe anyway, just log the warning.
-            # The audio check being negative doesn't mean the transcript is useless —
-            # 360 cameras and other sources may have speech that fails the
-            # speech-ratio check due to ambient noise characteristics.
-            # We still transcribe and let the downstream length checks
-            # (len > 20 for refinement, strip() for summary) decide.
             self.log.emit("[orchestrator] Audio check: low/no speech detected. "
                           "Transcribing anyway (downstream checks will filter).")
             self._start_transcription(video_path)
 
     def _on_audio_check_error(self, msg: str):
+        if self._cancelling:
+            return
         self.log.emit(f"[warning] Audio check failed: {msg} — transcribing anyway")
         video_path = self._queue[self._current_index]
         self._start_transcription(video_path)
 
     def _on_classify_done(self, result: ClipClassification | None, frame_paths: list[str]):
+        if self._cancelling:
+            return
         self._step_timing.classification_s = time.monotonic() - self._classify_start
         self._classification = result
         self._classify_frame_paths = frame_paths
@@ -408,6 +739,8 @@ class PipelineOrchestrator(QObject):
             self._frame_worker.start()
 
     def _on_classify_error(self, msg: str):
+        if self._cancelling:
+            return
         self.log.emit(f"[warning] Classification failed: {msg}")
         self._classification = None
         self._classify_done = True
@@ -426,6 +759,8 @@ class PipelineOrchestrator(QObject):
         self._frame_worker.start()
 
     def _on_frames_done(self, paths: list[str]):
+        if self._cancelling:
+            return
         self._step_timing.frame_extraction_s = time.monotonic() - self._frames_start
         self._frame_paths = paths
         self._frames_done = True
@@ -435,12 +770,16 @@ class PipelineOrchestrator(QObject):
         self._check_ready_for_llm()
 
     def _on_frame_error(self, msg: str):
+        if self._cancelling:
+            return
         self.log.emit(f"[error] Frame extraction failed: {msg}")
         self._frames_done = True
         self.frame_count_update.emit(0)
         self._check_ready_for_llm()
 
     def _on_transcript_done(self, text: str):
+        if self._cancelling:
+            return
         self._step_timing.transcription_s = time.monotonic() - self._transcribe_start
         self._transcript = text
         self._transcript_done = True
@@ -449,22 +788,42 @@ class PipelineOrchestrator(QObject):
         self._check_ready_for_llm()
 
     def _on_transcript_error(self, msg: str):
+        if self._cancelling:
+            return
         self.log.emit(f"[warning] Transcription failed: {msg}")
         self._transcript = ""
         self._transcript_done = True
         self.transcript_text_done.emit("")
         self._check_ready_for_llm()
 
+    # ------------------------------------------------------------------
+    # LLM gate
+    # ------------------------------------------------------------------
+
     def _check_ready_for_llm(self):
         if not (self._frames_done and self._transcript_done and self._classify_done):
+            self.log.emit(
+                f"[orchestrator] LLM gate check: frames={self._frames_done} "
+                f"transcript={self._transcript_done} classify={self._classify_done} — waiting"
+            )
             return
+
+        # Guard: prevent double-fire if multiple signals arrive after all flags are set
+        if self._llm_started:
+            self.log.emit("[orchestrator] LLM already started — ignoring duplicate gate trigger")
+            return
+        self._llm_started = True
 
         if not self._frame_paths and not self._transcript:
             self.log.emit("[warning] No frames or transcript — skipping LLM.")
             self._finalize_video(None, [])
             return
 
-        self.log.emit("[orchestrator] Starting LLM pipeline...")
+        self.log.emit(
+            f"[orchestrator] Starting LLM pipeline — "
+            f"transcript={len(self._transcript)} chars, "
+            f"frames={len(self._frame_paths)}"
+        )
         self._llm_start = time.monotonic()
         self._llm_worker = LLMWorker(
             self._transcript, self._frame_paths, self.settings
@@ -475,10 +834,24 @@ class PipelineOrchestrator(QObject):
         self._llm_worker.error.connect(self._on_llm_error)
         self._llm_worker.start()
 
+    # ------------------------------------------------------------------
+    # LLM + refinement handlers
+    # ------------------------------------------------------------------
+
     def _on_llm_done(self, summary, keywords: list[str]):
+        if self._cancelling:
+            return
         self._step_timing.llm_s = time.monotonic() - self._llm_start
         if summary:
             self.transcript_summary_done.emit(summary)
+            self.log.emit(f"[orchestrator] Summary: \"{summary.title}\" | "
+                          f"{len(summary.summary)} char description | "
+                          f"{len(summary.topics)} topics | "
+                          f"{len(keywords)} keywords")
+        else:
+            self.log.emit(f"[orchestrator] ⚠ No transcript summary produced! "
+                          f"transcript_len={len(self._transcript)}, "
+                          f"frames={len(self._frame_paths)}")
         self.keywords_done.emit(keywords)
 
         if self._classification and self._transcript and len(self._transcript.strip()) > 20:
@@ -500,6 +873,8 @@ class PipelineOrchestrator(QObject):
 
     def _on_refinement_done(self, refinement: ClipRefinement | None,
                             summary: TranscriptSummary | None, keywords: list[str]):
+        if self._cancelling:
+            return
         self._step_timing.refinement_s = time.monotonic() - self._refine_start
         self._refinement = refinement
         if refinement:
@@ -513,14 +888,23 @@ class PipelineOrchestrator(QObject):
 
     def _on_refinement_error(self, msg: str,
                               summary: TranscriptSummary | None, keywords: list[str]):
+        if self._cancelling:
+            return
         self.log.emit(f"[warning] Refinement failed: {msg}")
         self._finalize_video(summary, keywords)
 
     def _on_llm_error(self, msg: str):
+        if self._cancelling:
+            return
         self.log.emit(f"[error] LLM pipeline failed: {msg}")
         self._finalize_video(None, [])
 
+    # ------------------------------------------------------------------
+    # Finalization
+    # ------------------------------------------------------------------
+
     def _finalize_video(self, summary: TranscriptSummary | None, keywords: list[str]):
+        self._watchdog.stop()
         video_path = self._queue[self._current_index]
 
         # Finalize total timing
@@ -593,32 +977,28 @@ class PipelineOrchestrator(QObject):
         output_folder = self._get_output_folder()
         if output_folder and (keywords or self._classification):
             os.makedirs(output_folder, exist_ok=True)
-            video_name = os.path.splitext(os.path.basename(video_path))[0]
-            csv_path = os.path.join(output_folder, f"{video_name}.csv")
+            csv_path = os.path.join(output_folder, f"{self._csv_stem(video_path)}.csv")
             export_csv(result, csv_path)
             self.log.emit(f"[export] CSV saved: {csv_path}")
 
         # Clean up temp frames
-        if self._temp_frames_dir and os.path.isdir(self._temp_frames_dir):
-            shutil.rmtree(self._temp_frames_dir, ignore_errors=True)
-
-        # Clean up classification temp frames
-        if self._classify_frame_paths:
-            tmp_dir = os.path.dirname(self._classify_frame_paths[0])
-            if os.path.isdir(tmp_dir) and tmp_dir.startswith(tempfile.gettempdir()):
-                shutil.rmtree(tmp_dir, ignore_errors=True)
+        self._cleanup_temp()
 
         self.video_completed.emit(self._current_index, result)
 
         self._current_index += 1
         self._process_next()
 
+    # ------------------------------------------------------------------
+    # Introspection
+    # ------------------------------------------------------------------
+
     def get_active_workers(self) -> list:
         """Return list of currently running QThread workers."""
         workers = []
         for attr in ("_audio_worker", "_classify_worker", "_transcript_worker",
-                      "_frame_worker", "_llm_worker", "_refine_worker",
-                      "_multicam_worker"):
+                      "_frame_worker", "_fast_frame_worker", "_fast_classify_worker",
+                      "_llm_worker", "_refine_worker", "_multicam_worker"):
             w = getattr(self, attr, None)
             if w is not None and w.isRunning():
                 workers.append(w)
